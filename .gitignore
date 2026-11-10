@@ -1,0 +1,4 @@
+bin/
+tests/work_*/
+__pycache__/
+*.pyc

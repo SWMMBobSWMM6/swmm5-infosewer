@@ -1,0 +1,146 @@
+//-----------------------------------------------------------------------------
+//   isewer.h
+//
+//   Project:  swmm5-infosewer (EPA SWMM 5.2.4 + InfoSewer gravity routing)
+//   Purpose:  shared definitions for isewer.c (input, network, steady state,
+//             HGL) and isewer_eps.c (extended period routing).
+//
+//   Written by Claude (AI) for SWMM Enablement, November 2026.
+//-----------------------------------------------------------------------------
+#ifndef ISEWER_H
+#define ISEWER_H
+
+//-----------------------------------------------------------------------------
+//  InfoSewer engine constants (he_define.h, stdafx.h). Copied exactly: the
+//  normal-depth bisection stops on a 1e-4 relative flow error, so changing
+//  1.49, 0.6667 or 3.1416 moves depths by up to ~1e-4.
+//-----------------------------------------------------------------------------
+#define IS_ZERO_TOL       0.0001       // HMAP_ZeroTolerance
+#define IS_DEPTH_TOL      0.0000001    // HMAP_DepthTolerance
+#define IS_ITER_FLOW_TOL  0.00001      // HMAP_IterFlowTolerance
+#define IS_MAX_MANNING    1.0          // HMAP_MaxManningCoeff
+#define IS_WETAREA_TOL    0.00001      // HMAP_WetAreaTolerance
+#define IS_DD_TOL         0.01         // HMAP_DepthDiamTolerance
+#define IS_FLOW_TOL       0.0001       // HMAP_FlowTolerance (compile-time)
+#define IS_SYS_ZERO       1.0e-10      // SYS_Zero
+#define IS_SYS_ZERO_FLOAT 1.0e-7       // SYS_ZeroFloat
+#define IS_PI_DEF         3.1415926    // 'pi' macro
+#define IS_BIG            1.0e37
+
+enum IsAnalysisType { IS_STEADY, IS_EPS };
+enum IsLoadType     { IS_UNPEAK, IS_PEAK, IS_COVER };
+enum IsSplitType    { IS_SPLIT_HYD, IS_SPLIT_PCT };
+enum IsInfilType    { IS_INF_NONE, IS_INF_LEN, IS_INF_LENDIA, IS_INF_SURF,
+                      IS_INF_COUNT, IS_INF_PATTERN };
+enum IsSlopeType    { IS_SLOPE_STANDARD, IS_SLOPE_FLAT, IS_SLOPE_ADVERSE };
+
+typedef struct
+{
+    int    node;             // SWMM node index
+    double baseIn;           // base load as read (project flow units)
+    double base;             // base load (cfs) = baseIn / flow factor
+    int    type;             // IS_UNPEAK, IS_PEAK, IS_COVER
+    char   pattern[MAXMSG+1];
+    int    pat;              // pattern index, -1 = none
+    double cover;            // coverage unit count
+}  TIsLoad;
+
+typedef struct
+{
+    char    id[MAXMSG+1];
+    int     linear;          // 1 = linear interpolation, 0 = stepwise
+    double* f;
+    int     n, nmax;
+}  TIsPattern;
+
+typedef struct
+{
+    char    id[MAXMSG+1];
+    double* x;
+    double* y;
+    int     n, nmax;
+}  TIsCurve;
+
+typedef struct               // one InfoSewer gravity pipe (= SWMM conduit)
+{
+    int    frm, to;          // SWMM node indexes
+    double fromInv, toInv;   // invert elevations (ft)
+    double length;           // ft
+    double dia;              // ft
+    double n;                // Manning n
+    int    count;            // parallel barrels
+    double slope;
+    int    slopeType;
+    int    adverse;          // from invert below to invert
+    int    split;            // IS_SPLIT_HYD or IS_SPLIT_PCT
+    double splitPct;
+    int    infType;
+    double infRate;          // converted (cfs per ft, per ft2, ...)
+    double infCount;
+    int    infPat;           // pattern for IS_INF_PATTERN
+    double kLoss;            // manhole minor loss K (SWMM inlet loss)
+    double fullFlow;         // full flow x count (cfs); -count if adverse
+}  TIsPipe;
+
+typedef struct               // one InfoSewer node (= SWMM junction or outfall)
+{
+    int    isOutlet;
+    double rim;              // ft
+    double cap;              // head cap: rim + surcharge depth (ft)
+    double bottomRef;        // lowest connected invert (ft)
+    double submerge;         // outlet fixed head (ft) or -IS_BIG
+    int    split;            // more than one outgoing pipe
+    int    nconn, *conn;     // connecting pipes, in link order
+    int    ndown, *down;     // downstream pipes (Fv_LinkOrder)
+    int    nup,   *up;       // upstream pipes  (Fv_LinkOrder)
+    int    nuph,  *uph;      // pipes used by the HGL sweep (conn - down)
+    int    nload, *load;     // indexes into IsLoads, in input order
+}  TIsNode;
+
+//-----------------------------------------------------------------------------
+//  Shared data (defined in isewer.c)
+//-----------------------------------------------------------------------------
+extern int        IsAnalysis;
+extern double     IsLoadMult;
+extern double     IsMinSegment, IsMinTravelTime;
+extern int        IsMaxSegments, IsFlowAttenuation;
+extern double     IsFlowTol, IsIterTol;     // converted to cfs
+extern double     IsFlowFactor;             // InfoSewer flow unit factor
+extern double     IsPatternStep;            // sec
+extern TIsNode*   IsNode;
+extern TIsPipe*   IsPipe;
+extern int*       IsOrder;                  // nodes, upstream to downstream
+extern TIsLoad*   IsLoads;
+extern int        IsNloads;
+extern TIsPattern* IsPats;
+extern int        IsNpats;
+extern char       IsResultsFile[];
+
+//-----------------------------------------------------------------------------
+//  Shared functions
+//-----------------------------------------------------------------------------
+// circular hydraulics (InfoSewer formulas)
+double isewer_wetArea(double d, double r);
+double isewer_wetPerimeter(double d, double r);
+double isewer_wetWidth(double d, double r);
+double isewer_linkFlow(int i, double d, double r, double n);
+double isewer_fullFlowBarrel(int i);
+double isewer_flowDepth(int i, double q);
+double isewer_pipeVelocity(double d, double r, double q);
+double isewer_headloss(int i, double q);
+double isewer_criticalDepth(int i, double q, double D);
+double isewer_infiltration(int i);
+
+// HGL sweep (He_RunHead): flows Q[], depths y[] in; heads, flags out
+void   isewer_runHead(const double* Q, const double* y, double* head,
+                      int* ftype, int* partial, int* adjFull, int resetFtype);
+
+// EPS (isewer_eps.c)
+int    isewer_epsInit(void);
+void   isewer_epsSetState(double tSec);
+void   isewer_epsNodeFlows(void);
+void   isewer_epsLoads(double tSec);
+void   isewer_epsReport(void);
+void   isewer_epsClose(void);
+
+#endif
