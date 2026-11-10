@@ -145,7 +145,8 @@ char* SectWords[]          = { ws_TITLE,          ws_OPTION,
                                ws_STREET,         ws_INLET_USAGE,
                                ws_INLET,          ws_ISW_LOADS,
                                ws_ISW_PATTERNS,   ws_ISW_CURVES,
-                               ws_ISW_SPLITS,     ws_ISW_INFIL,      NULL};
+                               ws_ISW_SPLITS,     ws_ISW_INFIL,      ws_ISW_CHAMBERS,
+                               ws_ISW_WETWELLS,   ws_ISW_PUMPS,      NULL};
 char* SnowmeltWords[]      = { w_PLOWABLE, w_IMPERV, w_PERV, w_REMOVAL, NULL};
 char* SurchargeWords[]     = { w_EXTRAN, w_SLOT, NULL};
 char* TempKeyWords[]       = { w_TIMESERIES, w_FILE, w_WINDSPEED, w_SNOWMELT,

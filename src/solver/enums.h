@@ -470,7 +470,8 @@ enum  CompatibilityType {
       s_MAP,          s_LID_CONTROL,  s_LID_USAGE,    s_GWF,
       s_ADJUST,       s_EVENT,        s_STREET,       s_INLET_USAGE,
       s_INLET,        s_ISW_LOADS,    s_ISW_PATTERNS,    // swmm5-infosewer
-      s_ISW_CURVES,   s_ISW_SPLITS,   s_ISW_INFIL};      // swmm5-infosewer
+      s_ISW_CURVES,   s_ISW_SPLITS,   s_ISW_INFIL,       // swmm5-infosewer
+      s_ISW_CHAMBERS, s_ISW_WETWELLS, s_ISW_PUMPS};      // swmm5-infosewer
 
  enum InputOptionType {
     FLOW_UNITS, INFIL_MODEL, ROUTE_MODEL,

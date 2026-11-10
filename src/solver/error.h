@@ -56,6 +56,12 @@ enum  ErrorType {
       ERR_ISEWER_NODE          = 146,   // swmm5-infosewer
       ERR_ISEWER_LINK          = 147,   // swmm5-infosewer
       ERR_ISEWER_DEADEND       = 148,   // swmm5-infosewer
+      ERR_ISEWER_PUMP          = 149,   // swmm5-infosewer
+      ERR_ISEWER_WELL          = 150,   // swmm5-infosewer
+      ERR_ISEWER_FM            = 142,   // swmm5-infosewer
+      ERR_ISEWER_PUMPFLOW      = 144,   // swmm5-infosewer
+      ERR_ISEWER_LIFT          = 152,   // swmm5-infosewer
+      ERR_ISEWER_EPS           = 154,   // swmm5-infosewer
 
 // ... RDII Errors
       ERR_UNITHYD_TIMES        = 151,

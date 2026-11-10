@@ -641,6 +641,15 @@ int  parseLine(int sect, char *line)
       case s_ISW_INFIL:
         return isewer_readInfil(Tok, Ntokens);
 
+      case s_ISW_CHAMBERS:
+        return isewer_readChamber(Tok, Ntokens);
+
+      case s_ISW_WETWELLS:
+        return isewer_readWetWell(Tok, Ntokens);
+
+      case s_ISW_PUMPS:
+        return isewer_readPump(Tok, Ntokens);
+
       case s_INLET_USAGE:
         return inlet_readUsageParams(Tok, Ntokens);
 

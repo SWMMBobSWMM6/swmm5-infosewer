@@ -1,20 +1,23 @@
 //-----------------------------------------------------------------------------
 //   isewer.c
 //
-//   Project:  swmm5-infosewer (EPA SWMM 5.2.4 + InfoSewer gravity routing)
-//   Purpose:  InfoSewer's gravity-sewer calculations as a SWMM5 flow routing
-//             option:  FLOW_ROUTING INFOSEWER
+//   Project:  swmm5-infosewer (EPA SWMM 5.2.4 + InfoSewer routing)
+//   Purpose:  InfoSewer's sewer calculations (gravity pipes, wet wells, pump
+//             stations, force mains, junction chambers) as a SWMM5 flow
+//             routing option:  FLOW_ROUTING INFOSEWER
 //               INFOSEWER_ANALYSIS STEADY  - InfoSewer steady state (loads by
 //                                            type, peaking, normal depth, HGL)
 //               INFOSEWER_ANALYSIS EPS     - InfoSewer extended period routing
 //                                            (isewer_eps.c)
 //
 //   This file: input sections and options, the InfoSewer network built from
-//   SWMM's conduits, junctions and outfalls, the steady-state solver, the HGL
-//   sweep shared with EPS, and the SWMM state and report hooks.
+//   SWMM's conduits, pumps, junctions, storage nodes and outfalls, siphons and
+//   pump stations, the steady-state solver, the HGL sweep shared with EPS,
+//   and the SWMM state and report hooks.
 //
 //   The calculations follow the InfoSewer engine (HeEngPkg, MWH Soft/Innovyze,
-//   1996-2011) as written up in spec/steady.md and spec/eps.md, which cite the
+//   1996-2011) as written up in docs/spec_steady.md, docs/spec_eps.md and
+//   docs/spec_pressure.md, which cite the
 //   C++ by file:line. Function comments name the engine function each one
 //   reproduces. Engine quirks are reproduced on purpose so results match
 //   InfoSewer bit for bit; each one is marked QUIRK.
@@ -51,6 +54,8 @@ static double IsFlowTolIn;     // flow tolerance as read (flow units)
 double  IsFlowTol, IsIterTol;  // flow tolerances (cfs)
 double  IsFlowFactor;          // InfoSewer flow unit factor
 double  IsPatternStep;         // loading pattern time step (sec)
+double  IsPumpStep;            // pump station time step (sec), HMAP_StationTimeStep
+int     IsLinkReport;          // InfoSewer [Report] Link : Yes (1) or No (0)
 char    IsResultsFile[MAXFNAME+1];  // optional full-precision CSV
 
 TIsLoad*    IsLoads;   int IsNloads;   static int MaxLoads;
@@ -59,9 +64,31 @@ static TIsCurve* IsCurves; static int IsNcurves, MaxCurves;
 
 TIsNode* IsNode;
 TIsPipe* IsPipe;
+TIsPump* IsPump;
+TIsWetWell* IsWell;
+TIsStation* IsStation;
+TIsSiphon* IsSiphon;
+int      IsNN, IsNP, IsNF, IsNPM, IsNPump, IsNWell, IsNStation, IsNSiphon, IsNT, IsNLE;
+int*     IsNodeOfSwmm;
+int*     IsLinkOfSwmm;
 int*     IsOrder;
 static int  IsNorder;
 static double* IsRim;        // junction rim saved before SWMM raises full depth
+static double* IsFullDepth0; // node full depth as read (wet well max level)
+static double* IsLinkInv;    // conduit end inverts as read (2 per link, ft)
+static int  IsPumpContinuity;    // "Pump Flow Continuity": 0 upstream, else station
+
+// pressure-network input ([INFOSEWER_CHAMBERS], _WETWELLS, _PUMPS)
+typedef struct { int node; double diam; } TIsChamberIn;
+typedef struct { int node; double minLevel, diam; char curve[MAXMSG+1]; } TIsWellIn;
+typedef struct { int link; int type; int extra; double v[7]; char pat[MAXMSG+1];
+                 double qs, qd; } TIsPumpIn;   // v: cap h0 h1 q1 h2 q2 speed
+static TIsChamberIn* ChamberIn; static int NchamberIn, MaxChamberIn;
+static TIsWellIn*    WellIn;    static int NwellIn, MaxWellIn;
+static TIsPumpIn*    PumpIn;    static int NpumpIn, MaxPumpIn;
+static double *SFmLoss;       // force main headloss (ft), per force main
+static double *SPumpHead;     // pump head increase (ft), per pump
+static double *SWellHead;     // wet well head (ft), per wet well
 
 // steady-state results (internal units: cfs, ft)
 static double *SQ, *SUP, *SPK, *SCV, *SCC, *SINF;  // link flow and components
@@ -88,7 +115,12 @@ static int    findCurve(const char* id);
 static int    growArray(void** a, int* nmax, int n, size_t size, int first);
 static double flowFactor(void);
 static int    buildNetwork(void);
+static int    classifyNodes(void);
+static int    classifyLinks(void);
+static int    buildSiphons(void);
 static int    buildTopology(void);
+static char*  linkId(int l);
+static int    netError(int code, char* id);
 static void   steadySolve(void);
 static double staticGetLoading(int k, double* up, double* pk, double* cv,
                                double* cc, double* inf);
@@ -131,13 +163,23 @@ void isewer_setDefaults(void)
     IsFlowAttenuation = 0;
     IsFlowTolIn = IS_FLOW_TOL;
     IsPatternStep = 3600.0;
+    IsPumpStep = 60.0;
+    IsLinkReport = 1;
     IsResultsFile[0] = '\0';
     IsLoads = NULL;  IsNloads = MaxLoads = 0;
     IsPats = NULL;   IsNpats = MaxPats = 0;
     IsCurves = NULL; IsNcurves = MaxCurves = 0;
     SplitIn = NULL;  NsplitIn = MaxSplitIn = 0;
     InfilIn = NULL;  NinfilIn = MaxInfilIn = 0;
-    IsNode = NULL;  IsPipe = NULL;  IsOrder = NULL;  IsRim = NULL;
+    ChamberIn = NULL;  NchamberIn = MaxChamberIn = 0;
+    WellIn = NULL;     NwellIn = MaxWellIn = 0;
+    PumpIn = NULL;     NpumpIn = MaxPumpIn = 0;
+    IsPumpContinuity = 0;
+    IsNode = NULL;  IsPipe = NULL;  IsOrder = NULL;  IsRim = NULL;  IsFullDepth0 = NULL;
+    IsPump = NULL;  IsWell = NULL;  IsStation = NULL;  IsSiphon = NULL;
+    IsNodeOfSwmm = NULL;  IsLinkOfSwmm = NULL;
+    IsNN = IsNP = IsNF = IsNPM = IsNPump = IsNWell = IsNStation = IsNSiphon = IsNT = IsNLE = 0;
+    SFmLoss = SPumpHead = SWellHead = NULL;
     IsAllocList = NULL;
     SQ = SUP = SPK = SCV = SCC = SINF = SDepth = SVel = SCrit = NULL;
     SStatic = SHead = SInc = NULL;
@@ -177,17 +219,25 @@ int isewer_readOption(char* s1, char* s2)
         sstrncpy(IsCoverCurveId, s2, MAXMSG);
         return 0;
     }
+    if ( match(k, "LINK_REPORT") )
+    {
+        if ( match(s2, "NO") ) IsLinkReport = 0;
+        else if ( match(s2, "YES") ) IsLinkReport = 1;
+        else return error_setInpError(ERR_KEYWORD, s2);
+        return 0;
+    }
     if ( match(k, "RESULTS_FILE") )
     {
         sstrncpy(IsResultsFile, s2, MAXFNAME);
         return 0;
     }
-    if ( match(k, "PATTERN_STEP") )
+    if ( match(k, "PATTERN_STEP") || match(k, "PUMP_STEP") )
     {
         DateTime t;
-        if ( getDouble(s2, &x) ) { IsPatternStep = x; return 0; }
+        double* step = match(k, "PATTERN_STEP") ? &IsPatternStep : &IsPumpStep;
+        if ( getDouble(s2, &x) ) { *step = x; return 0; }
         if ( !datetime_strToTime(s2, &t) ) return error_setInpError(ERR_DATETIME, s2);
-        IsPatternStep = floor(t * SECperDAY + 0.5);
+        *step = floor(t * SECperDAY + 0.5);
         return 0;
     }
     if ( !getDouble(s2, &x) ) return error_setInpError(ERR_NUMBER, s2);
@@ -204,6 +254,7 @@ int isewer_readOption(char* s1, char* s2)
     else if ( match(k, "MIN_TRAVEL_TIME") )    IsMinTravelTime = x;
     else if ( match(k, "FLOW_ATTENUATION") )   IsFlowAttenuation = (x >= IS_ZERO_TOL);
     else if ( match(k, "FLOW_TOLERANCE") )     IsFlowTolIn = x;
+    else if ( match(k, "PUMP_CONTINUITY") )    IsPumpContinuity = ((int)x != 0);  // QUIRK he_input.cpp:9712
     else return error_setInpError(ERR_KEYWORD, s1);
     return 0;
 }
@@ -366,6 +417,81 @@ int isewer_readInfil(char* tok[], int ntoks)
     return 0;
 }
 
+int isewer_readChamber(char* tok[], int ntoks)
+//  [INFOSEWER_CHAMBERS]  Node  [Diameter]
+//  Marks a junction as an InfoSewer junction chamber (force main node).
+{
+    int j;
+    double d = 0.0;
+    if ( ntoks < 1 ) return error_setInpError(ERR_ITEMS, "");
+    j = project_findObject(NODE, tok[0]);
+    if ( j < 0 ) return error_setInpError(ERR_NAME, tok[0]);
+    if ( ntoks > 1 && !getDouble(tok[1], &d) ) return error_setInpError(ERR_NUMBER, tok[1]);
+    if ( growArray((void**)&ChamberIn, &MaxChamberIn, NchamberIn, sizeof(TIsChamberIn), 16) )
+        return ERR_MEMORY;
+    ChamberIn[NchamberIn].node = j;
+    ChamberIn[NchamberIn].diam = d;
+    NchamberIn++;
+    return 0;
+}
+
+int isewer_readWetWell(char* tok[], int ntoks)
+//  [INFOSEWER_WETWELLS]  Node  MinLevel  [VolumeCurve|*  [Diameter]]
+//  For a SWMM storage node: bottom = invert, maximum level = max depth,
+//  initial level = initial depth. A volume curve (level vs volume,
+//  [INFOSEWER_CURVES]) makes it a variable-area well; otherwise it is a
+//  cylinder of the given diameter (default: from the CYLINDRICAL area).
+{
+    int j;
+    double x;
+    TIsWellIn* w;
+    if ( ntoks < 2 ) return error_setInpError(ERR_ITEMS, "");
+    j = project_findObject(NODE, tok[0]);
+    if ( j < 0 ) return error_setInpError(ERR_NAME, tok[0]);
+    if ( !getDouble(tok[1], &x) ) return error_setInpError(ERR_NUMBER, tok[1]);
+    if ( growArray((void**)&WellIn, &MaxWellIn, NwellIn, sizeof(TIsWellIn), 16) )
+        return ERR_MEMORY;
+    w = &WellIn[NwellIn++];
+    w->node = j;  w->minLevel = x;  w->curve[0] = '\0';  w->diam = -1.0;
+    if ( ntoks > 2 && strcmp(tok[2], "*") != 0 ) sstrncpy(w->curve, tok[2], MAXMSG);
+    if ( ntoks > 3 )
+    {
+        if ( !getDouble(tok[3], &w->diam) || w->diam <= 0.0 )
+            return error_setInpError(ERR_NUMBER, tok[3]);
+    }
+    return 0;
+}
+
+int isewer_readPump(char* tok[], int ntoks)
+//  [INFOSEWER_PUMPS]  Link  CAPACITY|POINT|THREEPOINT  Extra  Capacity  Head0
+//                     Head1  Flow1  Head2  Flow2  Speed  Pattern|-  StaticFlow  BaseFlow
+//  InfoSewer's own pump definition ([Pumps] fields 3-14); flows in flow
+//  units, heads in ft (m). The SWMM pump curve is for stock SWMM only.
+{
+    int j, i;
+    TIsPumpIn* pp;
+    if ( ntoks < 13 ) return error_setInpError(ERR_ITEMS, "");
+    j = project_findObject(LINK, tok[0]);
+    if ( j < 0 ) return error_setInpError(ERR_NAME, tok[0]);
+    if ( growArray((void**)&PumpIn, &MaxPumpIn, NpumpIn, sizeof(TIsPumpIn), 16) )
+        return ERR_MEMORY;
+    pp = &PumpIn[NpumpIn];
+    pp->link = j;
+    if      ( match(tok[1], "CAPACITY") )   pp->type = IS_PUMP_CAPACITY;
+    else if ( match(tok[1], "POINT") )      pp->type = IS_PUMP_POINT;
+    else if ( match(tok[1], "THREEPOINT") ) pp->type = IS_PUMP_3POINT;
+    else return error_setInpError(ERR_KEYWORD, tok[1]);
+    pp->extra = atoi(tok[2]);
+    for ( i = 0; i < 7; i++ )
+        if ( !getDouble(tok[3+i], &pp->v[i]) ) return error_setInpError(ERR_NUMBER, tok[3+i]);
+    pp->pat[0] = '\0';
+    if ( strcmp(tok[10], "-") != 0 && strcmp(tok[10], "*") != 0 ) sstrncpy(pp->pat, tok[10], MAXMSG);
+    if ( !getDouble(tok[11], &pp->qs) ) return error_setInpError(ERR_NUMBER, tok[11]);
+    if ( !getDouble(tok[12], &pp->qd) ) return error_setInpError(ERR_NUMBER, tok[12]);
+    NpumpIn++;
+    return 0;
+}
+
 static int findPattern(const char* id)
 {
     int p;
@@ -383,14 +509,40 @@ static int findCurve(const char* id)
 void isewer_saveRims(void)
 //  Called by project_validate before link_validate raises a node's full
 //  depth to the crown of its highest conduit: InfoSewer caps unlocked
-//  manhole heads at the rim the user gave, so keep it.
+//  manhole heads at the rim the user gave, and a wet well's maximum level is
+//  the storage depth the user gave, so keep both. Also keeps each conduit's
+//  end inverts as read: link_validate drops an offset below the node invert
+//  (WARNING 03), but InfoSewer uses the pipe inverts as given, even below a
+//  wet well bottom.
 {
-    int j;
+    int i, j;
     FREE(IsRim);
+    FREE(IsFullDepth0);
+    FREE(IsLinkInv);
     IsRim = (double*) calloc(Nobjects[NODE] + 1, sizeof(double));
-    if ( !IsRim ) { report_writeErrorMsg(ERR_MEMORY, ""); return; }
+    IsFullDepth0 = (double*) calloc(Nobjects[NODE] + 1, sizeof(double));
+    IsLinkInv = (double*) calloc(2 * Nobjects[LINK] + 2, sizeof(double));
+    if ( !IsRim || !IsFullDepth0 || !IsLinkInv ) { report_writeErrorMsg(ERR_MEMORY, ""); return; }
     for ( j = 0; j < Nobjects[NODE]; j++ )
+    {
         IsRim[j] = Node[j].invertElev + Node[j].fullDepth;
+        IsFullDepth0[j] = Node[j].fullDepth;
+    }
+    for ( i = 0; i < Nobjects[LINK]; i++ )
+    {
+        double e1 = Node[Link[i].node1].invertElev, e2 = Node[Link[i].node2].invertElev;
+        double o1 = Link[i].offset1, o2 = Link[i].offset2;
+        if ( LinkOffsets == ELEV_OFFSET )
+        {
+            IsLinkInv[2*i]   = (o1 <= MISSING) ? e1 : o1;
+            IsLinkInv[2*i+1] = (o2 <= MISSING) ? e2 : o2;
+        }
+        else
+        {
+            IsLinkInv[2*i]   = e1 + o1;
+            IsLinkInv[2*i+1] = e2 + o2;
+        }
+    }
 }
 
 static double flowFactor(void)
@@ -641,6 +793,54 @@ static double curveY(int c, double x)
 //  Network
 //=============================================================================
 
+double isewer_wellVolumeFromLevel(int w, double level)
+//  HU_GetVarAreaWellVolumeFromLevel he_util.cpp:1661 (curve wells only)
+{
+    TIsCurve* c;
+    int i;
+    if ( IsWell[w].curve < 0 ) return 0.0;
+    c = &IsCurves[IsWell[w].curve];
+    if ( c->n <= 0 ) return 0.0;
+    if ( c->n == 1 ) return c->y[0];
+    for ( i = 1; i < c->n; i++ )
+        if ( c->x[i] > level )
+        {
+            double x1 = c->x[i-1], x2 = c->x[i], y1 = c->y[i-1], y2 = c->y[i];
+            double deltaX = level - x1;
+            return y1 + ((y2 - y1)/(x2 - x1))*(deltaX);
+        }
+    return c->y[c->n - 1];
+}
+
+double isewer_wellLevelFromVolume(int w, double volume)
+//  HU_GetWellLevelFromVolume he_util.cpp:1539
+{
+    TIsWetWell* ww = &IsWell[w];
+    if ( volume <= 0.0 ) return 0.0;
+    if ( ww->curve < 0 )
+    {
+        double radius = 0.5*ww->diameter;
+        double area = IS_PI_DEF*radius*radius;
+        return volume/area;
+    }
+    else
+    {
+        // HU_GetVarAreaWellLevelFromVolume he_util.cpp:1708
+        TIsCurve* c = &IsCurves[ww->curve];
+        int i;
+        if ( c->n <= 0 ) return 0.0;
+        if ( c->n == 1 ) return c->x[0];
+        for ( i = 1; i < c->n; i++ )
+            if ( c->y[i] > volume )
+            {
+                double x1 = c->x[i-1], x2 = c->x[i], y1 = c->y[i-1], y2 = c->y[i];
+                double deltaY = volume - y1;
+                return x1 + ((x2 - x1)/(y2 - y1))*(deltaY);
+            }
+        return c->x[c->n - 1];
+    }
+}
+
 void isewer_init(void)
 //  Called by flowrout_init in place of validateTreeLayout. Builds the
 //  InfoSewer network and, for steady state, solves it; for EPS it routes the
@@ -673,52 +873,237 @@ static int netError(int code, char* id)
     return ErrorCode ? ErrorCode : code;
 }
 
-static int buildNetwork(void)
-//  InfoSewer nodes and pipes from SWMM junctions, outfalls and conduits.
-//  Mirrors he_input.cpp: Fv_ReadPipe (slope, bottom reference),
-//  Fv_UnitConversion, and the option conversions of he_input.cpp:12143-12339.
+static char* linkId(int l)
+//  ID of a topology link: the SWMM conduit, or a station's first pump.
 {
-    int    i, j, k, n1, n2, N = Nobjects[NODE], L = Nobjects[LINK];
+    if ( l < IsNPM ) return Link[IsPipe[l].swmm].ID;
+    return Link[IsPump[IsStation[IsPipe[l].station].pump[0]].swmm].ID;
+}
+
+static int classifyNodes(void)
+//  InfoSewer node order (he_input.cpp:740): loading manholes, junction
+//  chambers, outlets, wet wells, each in SWMM input order.
+{
+    int j, k, m, N = Nobjects[NODE], pass, kind;
+    int *isChamber;
+
+    isChamber = (int*) calloc(N + 1, sizeof(int));
+    if ( !isChamber ) return netError(ERR_MEMORY, "");
+    for ( m = 0; m < NchamberIn; m++ ) isChamber[ChamberIn[m].node] = 1;
+    for ( j = 0; j < N; j++ )
+    {
+        if ( Node[j].type == JUNCTION || Node[j].type == OUTFALL ) continue;
+        if ( Node[j].type == STORAGE ) continue;
+        FREE(isChamber);
+        return netError(ERR_ISEWER_NODE, Node[j].ID);
+    }
+    IsNN = N;
+    IsNWell = 0;
+    k = 0;
+    for ( pass = 0; pass < 4; pass++ )
+    {
+        for ( j = 0; j < N; j++ )
+        {
+            if ( Node[j].type == JUNCTION ) kind = isChamber[j] ? IS_NODE_CHAMBER : IS_NODE_LOAD;
+            else if ( Node[j].type == OUTFALL ) kind = IS_NODE_OUTLET;
+            else kind = IS_NODE_WETWELL;
+            if ( kind != pass ) continue;
+            IsNode[k].kind = kind;
+            IsNode[k].swmm = j;
+            IsNode[k].isOutlet = (kind == IS_NODE_OUTLET);
+            IsNode[k].wetwell = -1;
+            if ( kind == IS_NODE_WETWELL ) IsNode[k].wetwell = IsNWell++;
+            IsNodeOfSwmm[j] = k;
+            k++;
+        }
+    }
+    FREE(isChamber);
+    return 0;
+}
+
+static int classifyLinks(void)
+//  InfoSewer link order (he_input.cpp:747): gravity pipes, force mains (the
+//  "pipe mains"), then pump elements; station links share the pump element
+//  index range (QUIRK: hm_pipeMainCount + station == hm_pipeMainCount + pump).
+{
+    int i, k, L = Nobjects[LINK], pass;
+    IsNP = IsNF = IsNPump = 0;
+    for ( i = 0; i < L; i++ )
+    {
+        if ( Link[i].type == CONDUIT )
+        {
+            if ( Link[i].xsect.type == FORCE_MAIN ) IsNF++;
+            else if ( Link[i].xsect.type == CIRCULAR ) IsNP++;
+            else return netError(ERR_ISEWER_LINK, Link[i].ID);
+        }
+        else if ( Link[i].type == PUMP ) IsNPump++;
+        else return netError(ERR_ISEWER_LINK, Link[i].ID);
+    }
+    if ( IsNF > 0 && ForceMainEqn != H_W ) return netError(ERR_ISEWER_FM, "");
+    IsNPM = IsNP + IsNF;
+    k = 0;
+    for ( pass = 0; pass < 3; pass++ )
+    {
+        for ( i = 0; i < L; i++ )
+        {
+            int kind;
+            if ( Link[i].type == PUMP ) kind = 2;
+            else kind = (Link[i].xsect.type == FORCE_MAIN) ? 1 : 0;
+            if ( kind != pass ) continue;
+            IsLinkOfSwmm[i] = k++;
+        }
+    }
+    return 0;
+}
+
+static int buildNetwork(void)
+//  InfoSewer nodes and links from SWMM junctions, outfalls, storage nodes,
+//  conduits and pumps. Mirrors he_input.cpp: Fv_ReadPipe (slope, bottom
+//  reference), Fv_ReadForceMain, Fv_ReadWetWell, Fv_ReadPump, the siphon and
+//  station set-ups, Fv_UnitConversion, Fv_SetPumpCoeffData and the option
+//  conversions of he_input.cpp:12143-12339.
+{
+    int    i, j, k, m, n1, n2, N = Nobjects[NODE], L = Nobjects[LINK];
     double lenF, diaF;
 
     if ( UnitSystem == US ) { lenF = 1.0;    diaF = 12.0; }
     else                    { lenF = 0.3048; diaF = 304.8; }
 
     IsNode = (TIsNode*) calloc(N + 1, sizeof(TIsNode));
-    IsPipe = (TIsPipe*) calloc(L + 1, sizeof(TIsPipe));
     IsOrder = (int*) calloc(N + 1, sizeof(int));
-    IsAllocList = (int*) calloc(8 * (L + 1) + IsNloads + 1, sizeof(int));  // conn, down, up, uph: 2L each
-    if ( !IsNode || !IsPipe || !IsOrder || !IsAllocList ) return netError(ERR_MEMORY, "");
+    IsNodeOfSwmm = (int*) calloc(N + 1, sizeof(int));
+    IsLinkOfSwmm = (int*) calloc(L + 1, sizeof(int));
+    if ( !IsNode || !IsOrder || !IsNodeOfSwmm || !IsLinkOfSwmm )
+        return netError(ERR_MEMORY, "");
+    if ( classifyNodes() ) return ErrorCode;
+    if ( classifyLinks() ) return ErrorCode;
+
+    // --- stations: pumps grouped by (wet well, to-node) (Fv_SetWorkStationData)
+    IsPump = (TIsPump*) calloc(IsNPump + 1, sizeof(TIsPump));
+    IsWell = (TIsWetWell*) calloc(IsNWell + 1, sizeof(TIsWetWell));
+    IsStation = (TIsStation*) calloc(IsNPump + 1, sizeof(TIsStation));
+    if ( !IsPump || !IsWell || !IsStation ) return netError(ERR_MEMORY, "");
+    for ( i = 0; i < L; i++ )
+    {
+        int p;
+        if ( Link[i].type != PUMP ) continue;
+        p = IsLinkOfSwmm[i] - IsNPM;
+        IsPump[p].swmm = i;
+        IsPump[p].frm = IsNodeOfSwmm[Link[i].node1];
+        IsPump[p].to  = IsNodeOfSwmm[Link[i].node2];
+        IsPump[p].station = -1;
+        if ( IsNode[IsPump[p].frm].kind != IS_NODE_WETWELL ) return netError(ERR_ISEWER_PUMP, Link[i].ID);
+        if ( IsNode[IsPump[p].to].kind == IS_NODE_WETWELL ||
+             IsNode[IsPump[p].to].kind == IS_NODE_OUTLET ) return netError(ERR_ISEWER_PUMP, Link[i].ID);
+        IsPump[p].wetwell = IsNode[IsPump[p].frm].wetwell;
+    }
+    IsNStation = 0;
+    for ( i = 0; i < IsNPump; i++ )
+    {
+        int s, cnt = 0;
+        if ( IsPump[i].station >= 0 ) continue;
+        s = IsNStation++;
+        IsPump[i].station = s;
+        for ( j = 0; j < IsNPump; j++ )
+        {
+            if ( j == i || IsPump[j].station >= 0 ) continue;
+            if ( IsPump[j].frm == IsPump[i].frm && IsPump[j].to == IsPump[i].to ) IsPump[j].station = s;
+        }
+        for ( j = 0; j < IsNPump; j++ ) if ( IsPump[j].station == s ) cnt++;
+        IsStation[s].pump = (int*) calloc(cnt + 1, sizeof(int));
+        if ( !IsStation[s].pump ) return netError(ERR_MEMORY, "");
+        IsStation[s].npump = 0;
+    }
+    for ( i = 0; i < IsNPump; i++ )
+    {
+        TIsStation* st = &IsStation[IsPump[i].station];
+        st->pump[st->npump++] = i;
+    }
+    IsNT  = IsNPM + IsNStation;
+    IsNLE = IsNPM + MAX(IsNPump, IsNStation);
+    IsPipe = (TIsPipe*) calloc(IsNT + 1, sizeof(TIsPipe));
+    IsAllocList = (int*) calloc(8 * (IsNT + 1) + IsNloads + 1, sizeof(int));  // conn, down, up, uph: 2 per link end
+    if ( !IsPipe || !IsAllocList ) return netError(ERR_MEMORY, "");
 
     // --- nodes
-    for ( j = 0; j < N; j++ )
+    for ( k = 0; k < IsNN; k++ )
     {
-        TIsNode* nd = &IsNode[j];
-        if ( Node[j].type == JUNCTION ) nd->isOutlet = 0;
-        else if ( Node[j].type == OUTFALL ) nd->isOutlet = 1;
-        else return netError(ERR_ISEWER_NODE, Node[j].ID);
+        TIsNode* nd = &IsNode[k];
+        j = nd->swmm;
         nd->rim = IsRim ? IsRim[j] : Node[j].invertElev + Node[j].fullDepth;
         nd->cap = nd->rim + Node[j].surDepth;
         nd->bottomRef = IS_BIG;
         nd->submerge = -IS_BIG;
-        if ( nd->isOutlet )
+        if ( nd->kind == IS_NODE_OUTLET )
         {
-            k = Node[j].subIndex;
-            if ( Outfall[k].type == FIXED_OUTFALL ) nd->submerge = Outfall[k].fixedStage;
+            m = Node[j].subIndex;
+            if ( Outfall[m].type == FIXED_OUTFALL ) nd->submerge = Outfall[m].fixedStage;
+        }
+        if ( nd->kind == IS_NODE_WETWELL )
+        {
+            // Fv_ReadWetWell he_input.cpp:4639, HD_WetWellData::F_ConvertUnit
+            TIsWetWell* w = &IsWell[nd->wetwell];
+            int found = -1;
+            w->node = k;
+            w->curve = -1;
+            w->bottom = Node[j].invertElev;
+            w->maxLevel = IsFullDepth0 ? IsFullDepth0[j] : Node[j].fullDepth;
+            w->initLevel = Node[j].initDepth;
+            for ( m = 0; m < NwellIn; m++ ) if ( WellIn[m].node == j ) found = m;
+            if ( found < 0 ) return netError(ERR_ISEWER_WELL, Node[j].ID);
+            w->minLevel = WellIn[found].minLevel / lenF;
+            // Fv_ReadWetWell he_input.cpp:4782-4825 level checks
+            if ( w->maxLevel < 0.0 || w->minLevel < 0.0 || w->initLevel < 0.0 ||
+                 w->minLevel >= w->maxLevel || w->initLevel < w->minLevel ||
+                 w->initLevel > w->maxLevel )
+                return netError(ERR_ISEWER_WELL, Node[j].ID);
+            if ( WellIn[found].curve[0] )
+            {
+                w->curve = findCurve(WellIn[found].curve);
+                if ( w->curve < 0 ) return netError(ERR_NAME, WellIn[found].curve);
+                w->diameter = 0.0;
+            }
+            else
+            {
+                // cylinder (Fv_ReadWetWell he_input.cpp:4836): volumes from the
+                // input-unit diameter and levels, then / volume unit factor
+                double d = WellIn[found].diam, area, volF;
+                m = Node[j].subIndex;
+                if ( Storage[m].shape != CYLINDRICAL ) return netError(ERR_ISEWER_WELL, Node[j].ID);
+                if ( d <= 0.0 ) d = 2.0 * sqrt(Storage[m].a0 / PI) * UCF(LENGTH);
+                volF = (UnitSystem == US) ? 1.0 : IS_M3_PER_FT3;
+                area = 0.25*IS_PI_DEF*d*d;
+                w->minVolume  = area*WellIn[found].minLevel / volF;
+                w->maxVolume  = area*(w->maxLevel*lenF) / volF;
+                w->initVolume = area*(w->initLevel*lenF) / volF;
+                w->diameter = d / lenF;
+            }
         }
     }
 
-    // --- pipes
+    // --- pipes and force mains
     for ( i = 0; i < L; i++ )
     {
-        TIsPipe* p = &IsPipe[i];
-        if ( Link[i].type != CONDUIT ) return netError(ERR_ISEWER_LINK, Link[i].ID);
-        if ( Link[i].xsect.type != CIRCULAR ) return netError(ERR_ISEWER_LINK, Link[i].ID);
+        TIsPipe* p;
+        if ( Link[i].type != CONDUIT ) continue;
+        p = &IsPipe[IsLinkOfSwmm[i]];
         k = Link[i].subIndex;
-        n1 = Link[i].node1;  n2 = Link[i].node2;
+        n1 = IsNodeOfSwmm[Link[i].node1];  n2 = IsNodeOfSwmm[Link[i].node2];
+        p->swmm = i;
+        p->kind = (Link[i].xsect.type == FORCE_MAIN) ? IS_LINK_FM : IS_LINK_PIPE;
+        p->station = -1;
+        p->siphon = -1;
         p->frm = n1;  p->to = n2;
-        p->fromInv = Node[n1].invertElev + Link[i].offset1;
-        p->toInv   = Node[n2].invertElev + Link[i].offset2;
+        if ( IsLinkInv )
+        {
+            p->fromInv = IsLinkInv[2*i];
+            p->toInv   = IsLinkInv[2*i+1];
+        }
+        else
+        {
+            p->fromInv = Node[Link[i].node1].invertElev + Link[i].offset1;
+            p->toInv   = Node[Link[i].node2].invertElev + Link[i].offset2;
+        }
         p->length  = Conduit[k].length;
         p->dia     = Link[i].xsect.yFull;
         p->n       = Conduit[k].roughness;
@@ -728,6 +1113,15 @@ static int buildNetwork(void)
         p->splitPct = 0.0;
         p->infType = IS_INF_NONE;  p->infRate = 0.0;  p->infCount = 0.0;
         p->infPat  = -1;
+        if ( p->kind == IS_LINK_FM )
+        {
+            // Fv_ReadForceMain he_input.cpp:5722: count is always 1
+            p->count = 1;
+            p->friction = Link[i].xsect.rBot;
+            if ( IsNode[n2].kind == IS_NODE_OUTLET ) return netError(ERR_ISEWER_LINK, Link[i].ID);
+            continue;
+        }
+        if ( IsNode[n1].kind == IS_NODE_CHAMBER ) return netError(ERR_ISEWER_LINK, Link[i].ID);
 
         // Fv_UpdateSlopeData he_data.cpp:5600
         p->slope = (p->fromInv - p->toInv) / p->length;
@@ -737,16 +1131,46 @@ static int buildNetwork(void)
         p->adverse = p->fromInv < p->toInv;       // Fv_CheckPipeInvert
 
         // bottom reference levels (he_input.cpp:5256-5270)
-        if ( !IsNode[n1].isOutlet )
+        if ( IsNode[n1].kind != IS_NODE_OUTLET )
             IsNode[n1].bottomRef = MIN(IsNode[n1].bottomRef, p->fromInv);
-        if ( !IsNode[n2].isOutlet )
+        if ( IsNode[n2].kind != IS_NODE_OUTLET )
             IsNode[n2].bottomRef = MIN(IsNode[n2].bottomRef, p->toInv);
+    }
+    // a force main lowers the bottom reference of a loading manhole at either
+    // end too (he_input.cpp:5960-5972; F_SetBottomRefLevel keeps the minimum)
+    for ( i = IsNP; i < IsNPM; i++ )
+    {
+        TIsPipe* p = &IsPipe[i];
+        if ( IsNode[p->frm].kind == IS_NODE_LOAD )
+            IsNode[p->frm].bottomRef = MIN(IsNode[p->frm].bottomRef, p->fromInv);
+        if ( IsNode[p->to].kind == IS_NODE_LOAD )
+            IsNode[p->to].bottomRef = MIN(IsNode[p->to].bottomRef, p->toInv);
+    }
+
+    // --- station links (Fv_SetStationLinkData he_input.cpp:7577)
+    for ( i = 0; i < IsNStation; i++ )
+    {
+        TIsPipe* p = &IsPipe[IsNPM + i];
+        TIsPump* first = &IsPump[IsStation[i].pump[0]];
+        p->kind = IS_LINK_STATION;
+        p->swmm = -1;
+        p->station = i;
+        p->siphon = -1;
+        p->frm = first->frm;
+        p->to = first->to;
+        p->count = 1;
+        IsStation[i].link = IsNPM + i;
+        IsStation[i].wetwell = first->wetwell;
+        IsStation[i].frm = first->frm;
+        IsStation[i].to = first->to;
+        IsStation[i].siphon = -1;
     }
 
     // --- percent splits (Fv_ReadFlowSplit; F_SetSplitFlowPercent)
     for ( i = 0; i < NsplitIn; i++ )
     {
-        TIsPipe* p = &IsPipe[SplitIn[i].link];
+        TIsPipe* p = &IsPipe[IsLinkOfSwmm[SplitIn[i].link]];
+        if ( Link[SplitIn[i].link].type != CONDUIT ) continue;
         p->splitPct = SplitIn[i].pct;
         if ( p->splitPct > 0.0 ) p->split = IS_SPLIT_PCT;
     }
@@ -754,7 +1178,9 @@ static int buildNetwork(void)
     // --- infiltration (Fv_ReadInfiltrateRate; HD_PipeData::F_ConvertUnit)
     for ( i = 0; i < NinfilIn; i++ )
     {
-        TIsPipe* p = &IsPipe[InfilIn[i].link];
+        TIsPipe* p;
+        if ( Link[InfilIn[i].link].type != CONDUIT ) continue;
+        p = &IsPipe[IsLinkOfSwmm[InfilIn[i].link]];
         p->infType  = InfilIn[i].type;
         p->infRate  = InfilIn[i].rate;
         p->infCount = InfilIn[i].count;
@@ -775,15 +1201,79 @@ static int buildNetwork(void)
     // --- loads (HD_LoadData::F_ConvertUnit) and their patterns
     for ( i = 0; i < IsNloads; i++ )
     {
+        IsLoads[i].node = IsNodeOfSwmm[IsLoads[i].node];
         IsLoads[i].base = IsLoads[i].baseIn / IsFlowFactor;
         if ( IsLoads[i].pattern[0] )
         {
             IsLoads[i].pat = findPattern(IsLoads[i].pattern);
             if ( IsLoads[i].pat < 0 ) return netError(ERR_NAME, IsLoads[i].pattern);
         }
-        if ( IsNode[IsLoads[i].node].isOutlet )
-            return netError(ERR_ISEWER_NODE, Node[IsLoads[i].node].ID);
+        if ( IsNode[IsLoads[i].node].kind != IS_NODE_LOAD )
+            return netError(ERR_ISEWER_NODE, Node[IsNode[IsLoads[i].node].swmm].ID);
     }
+
+    // --- pumps (Fv_ReadPump he_input.cpp:6718, HD_PumpData::F_ConvertUnit,
+    //     Fv_SetPumpCoeffData he_input.cpp:12515)
+    for ( i = 0; i < IsNPump; i++ )
+    {
+        TIsPump* pu = &IsPump[i];
+        TIsPumpIn* in = NULL;
+        double cap, h0, h1, q1, h2, q2;
+        for ( m = 0; m < NpumpIn; m++ ) if ( PumpIn[m].link == pu->swmm ) in = &PumpIn[m];
+        if ( !in ) return netError(ERR_ISEWER_PUMP, Link[pu->swmm].ID);
+        pu->type = in->type;
+        pu->parallel = in->extra + 1;
+        cap = in->v[0];  h0 = in->v[1];  h1 = in->v[2];  q1 = in->v[3];
+        h2 = in->v[4];   q2 = in->v[5];
+        pu->speed = in->v[6];
+        pu->pattern = -1;
+        if ( in->pat[0] )
+        {
+            pu->pattern = findPattern(in->pat);
+            if ( pu->pattern < 0 ) return netError(ERR_NAME, in->pat);
+        }
+        pu->staticFlow = in->qs;
+        pu->baseFlow = in->qd <= 0.0 ? 1.0 : in->qd;
+        if ( pu->type == IS_PUMP_CAPACITY )
+        {
+            h0 = h1 = q1 = h2 = q2 = 0.0;
+            pu->speed = 1.0;
+        }
+        else
+        {
+            cap = 0.0;
+            if ( pu->type == IS_PUMP_POINT )
+            {
+                h0 = 1.33334*h1;    // shut-off head
+                h2 = 0.0;           // max. flow head
+                q2 = 2.0*q1;        // max. flow
+            }
+        }
+        pu->capacity = cap / IsFlowFactor;
+        pu->head0 = h0 / lenF;  pu->head1 = h1 / lenF;  pu->head2 = h2 / lenF;
+        pu->flow1 = q1 / IsFlowFactor;  pu->flow2 = q2 / IsFlowFactor;
+        pu->a = pu->b = 0.0;
+        if ( pu->type != IS_PUMP_CAPACITY )
+        {
+            double deltaH2 = pu->head0 - pu->head2;
+            double deltaH1 = pu->head0 - pu->head1;
+            pu->b = log(deltaH2/deltaH1)/log(pu->flow2/pu->flow1);
+            pu->a = (pu->head0 - pu->head1)/pow((double)pu->parallel*pu->flow1, pu->b);
+            if ( pu->a < 0.0 || pu->b <= 0.0 || pu->b > 20.0 )
+                return netError(ERR_ISEWER_PUMP, Link[pu->swmm].ID);
+        }
+    }
+    for ( i = 0; i < IsNStation; i++ )             // Fv_CheckParallelPumpV2
+    {
+        int ncap = 0;
+        for ( m = 0; m < IsStation[i].npump; m++ )
+            if ( IsPump[IsStation[i].pump[m]].type == IS_PUMP_CAPACITY ) ncap++;
+        if ( ncap > 0 && ncap < IsStation[i].npump )
+            return netError(ERR_ISEWER_PUMP, Link[IsPump[IsStation[i].pump[0]].swmm].ID);
+    }
+
+    // --- siphons (Fv_SetSiphonData he_input.cpp:6240-6717)
+    if ( buildSiphons() ) return ErrorCode;
 
     // --- peaking curves (he_input.cpp:12269: peak-flow curves only scaled)
     IsPeakCurve = IsCoverCurve = -1;
@@ -803,21 +1293,215 @@ static int buildNetwork(void)
         if ( IsCoverCurve < 0 ) return netError(ERR_NAME, IsCoverCurveId);
     }
 
-    // --- flow tolerances (he_input.cpp:12321, 12339)
+    // --- wet well level-volume curves (he_input.cpp:12218: x / length
+    //     factor, y / volume factor) and their volumes (Fv_SetWetWellVolumeData)
+    if ( UnitSystem != US )
+    {
+        int c, *done = (int*) calloc(IsNcurves + 1, sizeof(int));
+        if ( !done ) return netError(ERR_MEMORY, "");
+        for ( i = 0; i < IsNWell; i++ )
+        {
+            c = IsWell[i].curve;
+            if ( c < 0 || done[c] ) continue;
+            done[c] = 1;
+            for ( m = 0; m < IsCurves[c].n; m++ )
+            {
+                IsCurves[c].x[m] *= 1.0 / lenF;
+                IsCurves[c].y[m] *= 1.0 / IS_M3_PER_FT3;
+            }
+        }
+        FREE(done);
+    }
+    for ( i = 0; i < IsNWell; i++ )
+    {
+        TIsWetWell* w = &IsWell[i];
+        if ( w->curve < 0 ) continue;
+        w->minVolume  = isewer_wellVolumeFromLevel(i, w->minLevel);
+        w->maxVolume  = isewer_wellVolumeFromLevel(i, w->maxLevel);
+        w->initVolume = isewer_wellVolumeFromLevel(i, w->initLevel);
+    }
+
+    // --- flow tolerances and minimum pipe segment (he_input.cpp:12320-12339)
+    IsMinSegment /= lenF;
     IsFlowTol = IsFlowTolIn / IsFlowFactor;
     IsIterTol = IS_ITER_FLOW_TOL;
     if ( IsIterTol > IsFlowTol ) IsIterTol = IsFlowTol;
 
-    // --- full flow of each pipe x barrels (HH_PipeCapacity)
-    for ( i = 0; i < L; i++ ) IsPipe[i].fullFlow = isewer_fullFlowBarrel(i) * IsPipe[i].count;
+    // --- full flow of each gravity pipe x barrels (HH_PipeCapacity)
+    for ( i = 0; i < IsNP; i++ ) IsPipe[i].fullFlow = isewer_fullFlowBarrel(i) * IsPipe[i].count;
+    return 0;
+}
+
+static int buildSiphons(void)
+//  Force mains grouped into siphons: Fv_GetSiphonSource, Fv_SetWorkSiphonData,
+//  Fv_SetSiphonResource, Fv_SetSiphonElementData, Fv_SetSiphonForceMainData,
+//  Fv_SetStationSiphonData (he_input.cpp:6240-7790). Force mains are indexed
+//  0..IsNF-1 here (link IsNP + f).
+{
+    int i, j, nf = IsNF, group = -1;
+    int *type, *flag, *index, *order;
+
+    IsNSiphon = 0;
+    IsSiphon = NULL;
+    if ( nf <= 0 )
+    {
+        if ( IsNStation > 0 )                 // a station must feed a siphon
+            return netError(ERR_ISEWER_PUMP, Link[IsPump[IsStation[0].pump[0]].swmm].ID);
+        return 0;
+    }
+    type = (int*) calloc(nf, sizeof(int));
+    flag = (int*) calloc(nf, sizeof(int));
+    index = (int*) calloc(nf, sizeof(int));
+    order = (int*) calloc(nf, sizeof(int));
+    if ( !type || !flag || !index || !order )
+    {
+        FREE(type); FREE(flag); FREE(index); FREE(order);
+        return netError(ERR_MEMORY, "");
+    }
+    for ( i = 0; i < nf; i++ ) { type[i] = -1;  index[i] = -1; }
+
+    // --- split / parallel force mains are invalid (Fv_CheckSplitForceMain)
+    for ( i = 0; i < nf; i++ )
+        for ( j = 0; j < nf; j++ )
+            if ( i != j && IsPipe[IsNP+i].frm == IsPipe[IsNP+j].frm )
+            {
+                FREE(type); FREE(flag); FREE(index); FREE(order);
+                return netError(ERR_ISEWER_LINK, Link[IsPipe[IsNP+j].swmm].ID);
+            }
+
+    // --- leaders (Fv_GetSiphonSource)
+    for ( i = 0; i < nf; i++ )
+        if ( IsNode[IsPipe[IsNP+i].frm].kind == IS_NODE_LOAD ) type[i] = IS_SIPHON_STANDARD;
+    for ( i = 0; i < nf; i++ )
+    {
+        int from = IsPipe[IsNP+i].frm, cand = 1;
+        if ( IsNode[from].kind != IS_NODE_CHAMBER ) continue;
+        for ( j = 0; j < nf; j++ )
+            if ( i != j && IsPipe[IsNP+j].to == from ) { cand = 0;  break; }
+        if ( cand ) type[i] = IS_SIPHON_STATION;
+    }
+
+    // --- chains (Fv_SetWorkSiphonData)
+    for ( i = 0; i < nf; i++ )
+    {
+        int ord = 0, toNode;
+        if ( type[i] < 0 ) continue;
+        group++;
+        flag[i] = 1;  index[i] = group;  order[i] = ord;
+        toNode = IsPipe[IsNP+i].to;
+        ord++;
+        for ( j = 0; j < nf; j++ )
+        {
+            int from;
+            if ( j == i || flag[j] ) continue;
+            from = IsPipe[IsNP+j].frm;
+            if ( from == toNode )
+            {
+                flag[j] = 1;  index[j] = group;  order[j] = ord;
+                if ( IsNode[from].kind == IS_NODE_LOAD ) break;
+                ord++;
+                toNode = IsPipe[IsNP+j].to;
+                j = -1;
+            }
+        }
+    }
+    for ( i = 0; i < nf; i++ )                 // a force main outside every siphon
+        if ( index[i] < 0 )                     // (e.g. leaving a wet well) has no
+        {                                       // flow or head rule in the engine
+            int id = IsPipe[IsNP+i].swmm;
+            FREE(type); FREE(flag); FREE(index); FREE(order);
+            return netError(ERR_ISEWER_LINK, Link[id].ID);
+        }
+    IsNSiphon = 0;
+    for ( i = 0; i < nf; i++ ) IsNSiphon = MAX(IsNSiphon, index[i] + 1);
+    if ( IsNSiphon <= 0 )
+    {
+        FREE(type); FREE(flag); FREE(index); FREE(order);
+        return netError(ERR_ISEWER_LINK, Link[IsPipe[IsNP].swmm].ID);
+    }
+    IsSiphon = (TIsSiphon*) calloc(IsNSiphon, sizeof(TIsSiphon));
+    if ( !IsSiphon ) { FREE(type); FREE(flag); FREE(index); FREE(order); return netError(ERR_MEMORY, ""); }
+
+    // --- elements (Fv_SetSiphonResource, Fv_SetSiphonElementData)
+    {
+        int siphonType = IS_SIPHON_STANDARD;    // QUIRK: carried between siphons
+        for ( i = 0; i < IsNSiphon; i++ )
+        {
+            int cnt = 0, e, f;
+            for ( f = 0; f < nf; f++ ) if ( index[f] == i ) cnt++;
+            IsSiphon[i].fm = (int*) calloc(cnt + 1, sizeof(int));
+            if ( !IsSiphon[i].fm ) { FREE(type); FREE(flag); FREE(index); FREE(order); return netError(ERR_MEMORY, ""); }
+            IsSiphon[i].nfm = cnt;
+            IsSiphon[i].station = -1;
+            for ( e = 0; e < cnt; e++ )
+                for ( f = 0; f < nf; f++ )
+                    if ( index[f] == i && order[f] == e )
+                    {
+                        IsSiphon[i].fm[e] = IsNP + f;
+                        if ( e == 0 && type[f] >= 0 ) siphonType = type[f];
+                    }
+            IsSiphon[i].type = siphonType;
+        }
+    }
+    FREE(type); FREE(flag); FREE(index); FREE(order);
+
+    // --- force main siphon data (Fv_SetSiphonForceMainData)
+    for ( i = 0; i < IsNSiphon; i++ )
+        for ( j = 0; j < IsSiphon[i].nfm; j++ )
+        {
+            TIsPipe* p = &IsPipe[IsSiphon[i].fm[j]];
+            p->siphon = i;
+            p->siphonType = IsSiphon[i].type;
+        }
+
+    // --- stations and their siphons (Fv_SetStationSiphonData he_input.cpp:7695)
+    for ( i = 0; i < IsNStation; i++ )
+    {
+        int s = -1;
+        for ( j = 0; j < IsNSiphon; j++ )
+            if ( IsPipe[IsSiphon[j].fm[0]].frm == IsStation[i].to ) s = j;
+        if ( s < 0 ) return netError(ERR_ISEWER_PUMP, Link[IsPump[IsStation[i].pump[0]].swmm].ID);
+        IsStation[i].siphon = s;
+        IsSiphon[s].station = i;
+        IsSiphon[s].type = IS_SIPHON_STATION;
+    }
+    for ( i = 0; i < IsNSiphon; i++ )
+    {
+        // a chamber-led siphon no station feeds has no flow rule in the engine
+        if ( IsSiphon[i].type == IS_SIPHON_STATION && IsSiphon[i].station < 0 )
+            return netError(ERR_ISEWER_LINK, Link[IsPipe[IsSiphon[i].fm[0]].swmm].ID);
+        for ( j = 0; j < IsSiphon[i].nfm; j++ )
+            IsPipe[IsSiphon[i].fm[j]].siphonType = IsSiphon[i].type;
+    }
+
+    // --- Fv_CheckStationData he_input.cpp:7800: a station discharges into a
+    //     junction chamber, and every curve pump's shut-off head must exceed
+    //     the lift from the wet well's initial level to the siphon tail invert
+    for ( i = 0; i < IsNStation; i++ )
+    {
+        TIsStation* st = &IsStation[i];
+        TIsSiphon* sp = &IsSiphon[st->siphon];
+        double headDown = IsPipe[sp->fm[sp->nfm - 1]].toInv;
+        if ( IsNode[st->to].kind != IS_NODE_CHAMBER )
+            return netError(ERR_ISEWER_PUMP, Link[IsPump[st->pump[0]].swmm].ID);
+        for ( j = 0; j < st->npump; j++ )
+        {
+            TIsPump* pu = &IsPump[st->pump[j]];
+            TIsWetWell* w = &IsWell[pu->wetwell];
+            if ( pu->type == IS_PUMP_CAPACITY ) continue;
+            if ( pu->head0 <= headDown - (w->initLevel + w->bottom) )
+                return netError(ERR_ISEWER_LIFT, Link[pu->swmm].ID);
+        }
+    }
     return 0;
 }
 
 static int buildTopology(void)
 //  Fv_SetLinkConnection, Fv_SetFlowSplitLoadNode, Fv_ManholeOrder,
-//  Fv_LinkOrder (he_topology.cpp, he_input.cpp:5680).
+//  Fv_LinkOrder (he_topology.cpp, he_input.cpp:5680). Topology links are the
+//  gravity pipes, force mains and station links.
 {
-    int  i, j, k, l, m, N = Nobjects[NODE], L = Nobjects[LINK];
+    int  i, j, k, l, m, N = IsNN, L = IsNT;
     int  *indeg, *vn, *vl, *cnt, *pool;
     int  norder, done, nvisit, nto;
 
@@ -832,7 +1516,7 @@ static int buildTopology(void)
     }
     pool = IsAllocList;
 
-    // --- connecting links in link input order
+    // --- connecting links in link order
     for ( i = 0; i < L; i++ ) { cnt[IsPipe[i].frm]++;  cnt[IsPipe[i].to]++; }
     for ( j = 0; j < N; j++ )
     {
@@ -849,24 +1533,38 @@ static int buildTopology(void)
         b->conn[b->nconn++] = i;
     }
 
-    // --- split manholes
+    // --- split manholes (loading manholes only) and dead ends
     for ( j = 0; j < N; j++ )
     {
         int nout = 0;
+        char* id = Node[IsNode[j].swmm].ID;
         for ( m = 0; m < IsNode[j].nconn; m++ )
             if ( IsPipe[IsNode[j].conn[m]].frm == j ) nout++;
-        IsNode[j].split = nout > 1;
-        if ( !IsNode[j].isOutlet && nout == 0 )
+        IsNode[j].split = (IsNode[j].kind == IS_NODE_LOAD && nout > 1);
+        if ( IsNode[j].kind != IS_NODE_OUTLET && nout == 0 )
         {
             FREE(indeg); FREE(vn); FREE(vl); FREE(cnt);
-            return netError(ERR_ISEWER_DEADEND, Node[j].ID);
+            return netError(ERR_ISEWER_DEADEND, id);
         }
-        if ( IsNode[j].isOutlet && nout > 0 )
+        if ( IsNode[j].kind == IS_NODE_OUTLET && nout > 0 )
         {
             FREE(indeg); FREE(vn); FREE(vl); FREE(cnt);
-            return netError(ERR_OUTFALL, Node[j].ID);
+            return netError(ERR_OUTFALL, id);
+        }
+        if ( IsNode[j].kind != IS_NODE_LOAD && nout > 1 )
+        {
+            FREE(indeg); FREE(vn); FREE(vl); FREE(cnt);
+            return netError(ERR_ISEWER_NODE, id);
         }
     }
+
+    // --- a force main may not leave a split manhole (he_input.cpp:5947)
+    for ( i = IsNP; i < IsNPM; i++ )
+        if ( IsNode[IsPipe[i].frm].split )
+        {
+            FREE(indeg); FREE(vn); FREE(vl); FREE(cnt);
+            return netError(ERR_ISEWER_LINK, Link[IsPipe[i].swmm].ID);
+        }
 
     // --- Fv_ManholeOrder he_topology.cpp:1377
     for ( j = 0; j < N; j++ )
@@ -894,7 +1592,7 @@ static int buildTopology(void)
                     if ( vn[nto] )
                     {
                         FREE(indeg); FREE(vn); FREE(vl); FREE(cnt);
-                        return netError(ERR_LOOP, Link[l].ID);
+                        return netError(ERR_LOOP, linkId(l));
                     }
                     vl[l] = 1;
                     if ( indeg[nto] > 0 ) { nvisit++;  indeg[nto]--; }
@@ -910,7 +1608,7 @@ static int buildTopology(void)
     {
         for ( j = 0; j < N; j++ ) if ( !vn[j] ) break;
         FREE(indeg); FREE(vn); FREE(vl); FREE(cnt);
-        return netError(ERR_LOOP, j < N ? Node[j].ID : "");
+        return netError(ERR_LOOP, j < N ? Node[IsNode[j].swmm].ID : "");
     }
 
     // --- Fv_LinkOrder he_topology.cpp:1525
@@ -920,7 +1618,7 @@ static int buildTopology(void)
         TIsNode* nd;
         k = IsOrder[m];
         nd = &IsNode[k];
-        if ( nd->isOutlet ) continue;
+        if ( nd->kind == IS_NODE_OUTLET ) continue;
         if ( nd->nconn == 1 )
         {
             l = nd->conn[0];
@@ -1041,40 +1739,504 @@ static double staticTotal(int k)
     return up + peakFlow(pk) + coverFlow(cv, cc) + 0.0;
 }
 
+//-----------------------------------------------------------------------------
+//  Force mains, siphons and pump stations (steady state)
+//-----------------------------------------------------------------------------
+
+static double fmHeadloss(int l, double flow)
+//  HD_ForceMainData::F_GetHeadloss he_data.cpp:6339
+{
+    TIsPipe* p = &IsPipe[l];
+    double headloss = 0.0, varN, varD;
+    if ( p->siphonType == IS_SIPHON_STATION || p->friction >= IS_MAX_MANNING )
+    {
+        double frictionPower = pow(p->friction, 1.852);
+        double diameterPower = pow(p->dia, 4.871);
+        double flowPower     = pow(flow, 1.852);
+        varN = 4.727*p->length*flowPower;
+        varD = frictionPower*diameterPower;
+        if ( fabs(varD) > IS_SYS_ZERO ) headloss = varN/varD;
+    }
+    else
+    {
+        varN = 4.66*p->friction*p->friction*p->length*flow*flow;
+        varD = pow(p->dia, 5.33);
+        if ( fabs(varD) > IS_SYS_ZERO ) headloss = varN/varD;
+    }
+    return headloss;
+}
+
+static void fmHydraulics(int l, double flow, double* velocity, double* headloss)
+//  HD_ForceMainData::F_GetHydraulicData he_data.cpp:6443
+{
+    TIsPipe* p = &IsPipe[l];
+    double area;
+    *velocity = 0.0;
+    *headloss = 0.0;
+    if ( p->length <= 0.0 || p->dia <= 0.0 || p->friction <= 0.0 || p->siphon < 0 ) return;
+    area = 0.25*IS_PI_DEF*p->dia*p->dia;
+    if ( fabs(area) > IS_SYS_ZERO ) *velocity = flow/area;
+    *headloss = fmHeadloss(l, flow);
+}
+
+static double siphonHeadloss(int s, double q)
+//  HD_SiphonData::F_GetSiphonHeadloss he_data.cpp:8114
+{
+    int i;
+    double h = 0.0;
+    for ( i = 0; i < IsSiphon[s].nfm; i++ ) h += fmHeadloss(IsSiphon[s].fm[i], q);
+    return h;
+}
+
+static double siphonTailHead(int s)
+//  HD_SiphonData::F_GetSiphonTailHead he_data.cpp:8082
+{
+    TIsPipe* p = &IsPipe[IsSiphon[s].fm[IsSiphon[s].nfm - 1]];
+    return p->toInv + p->dia;
+}
+
+static double siphonNewtonFactor(int s, double q)
+//  HD_SiphonData::F_GetSiphonNewtonFactor he_data.cpp:8180
+{
+    int i;
+    double factor = 0.0, constant = 4.727*1.852, flowPower = pow(q, 0.852);
+    for ( i = 0; i < IsSiphon[s].nfm; i++ )
+    {
+        TIsPipe* p = &IsPipe[IsSiphon[s].fm[i]];
+        double frictionPower = pow(p->friction, 1.852);
+        double diameterPower = pow(p->dia, 4.871);
+        double varN = constant*p->length*flowPower;
+        double varD = frictionPower*diameterPower;
+        if ( fabs(varD) > IS_SYS_ZERO ) factor += varN/varD;
+    }
+    return factor;
+}
+
+
+// --- force main and siphon helpers shared with isewer_eps.c
+double isewer_siphonHeadloss(int s, double q)   { return siphonHeadloss(s, q); }
+double isewer_siphonTailHead(int s)             { return siphonTailHead(s); }
+double isewer_siphonNewtonFactor(int s, double q) { return siphonNewtonFactor(s, q); }
+void   isewer_fmHydraulics(int l, double q, double* v, double* h) { fmHydraulics(l, q, v, h); }
+
+static int    *SVisit;                    // links visited by the flow pass
+static double *SPumpHead0, *SPumpA, *SPumpB, *SPumpPB, *SPumpOn, *SPumpSpeed;
+static double  SUpdatedPumpFlow;          // hm_updatedPumpFlow
+
+static int isPointPump(int p) { return IsPump[p].type != IS_PUMP_CAPACITY; }
+
+static void standardSiphonFlow(int s, double inflow)
+//  Fc_StaticGetStandardSiphonFlow he_hydrun.cpp:4273
+{
+    int i;
+    for ( i = 0; i < IsSiphon[s].nfm; i++ )
+    {
+        int l = IsSiphon[s].fm[i];
+        SQ[l] = inflow;
+        fmHydraulics(l, inflow, &SVel[l], &SFmLoss[l - IsNP]);
+    }
+}
+
+static void stationSiphonFlow(int s)
+//  Fc_StaticGetStationSiphonFlow he_hydrun.cpp:4313. QUIRK: one unit of each
+//  pump (no parallel count), read from the pump element flows.
+{
+    TIsStation* st = &IsStation[IsSiphon[s].station];
+    double stationFlow = 0.0;
+    int i;
+    for ( i = 0; i < st->npump; i++ ) stationFlow += SQ[IsNPM + st->pump[i]];
+    for ( i = 0; i < IsSiphon[s].nfm; i++ )
+    {
+        int l = IsSiphon[s].fm[i];
+        SQ[l] = stationFlow;
+        SUP[l] = stationFlow;
+        fmHydraulics(l, stationFlow, &SVel[l], &SFmLoss[l - IsNP]);
+    }
+}
+
+static void siphonFlow(int l, double inflow, double up, double pk, double cv,
+                       double cc, double inf)
+//  Fc_StaticGetSiphonFlow he_hydrun.cpp:4127 (siphon flow option Upstream)
+{
+    int s, i;
+    if ( SVisit[l] ) return;
+    s = IsPipe[l].siphon;
+    if ( IsSiphon[s].type == IS_SIPHON_STANDARD ) standardSiphonFlow(s, inflow);
+    else stationSiphonFlow(s);
+    for ( i = 0; i < IsSiphon[s].nfm; i++ )
+    {
+        int f = IsSiphon[s].fm[i];
+        if ( IsSiphon[s].type == IS_SIPHON_STATION )
+        {
+            if ( IsPumpContinuity == 0 )
+            {
+                SQ[f] = inflow;
+                SUP[f] = up;  SPK[f] = pk;  SCV[f] = cv;  SCC[f] = cc;  SINF[f] = inf;
+            }
+            else
+            {
+                SUP[f] = SQ[f];
+                SPK[f] = SCV[f] = SCC[f] = SINF[f] = 0.0;
+            }
+        }
+        else
+        {
+            SUP[f] = up;  SPK[f] = pk;  SCV[f] = cv;  SCC[f] = cc;  SINF[f] = inf;
+        }
+    }
+    for ( i = 0; i < IsSiphon[s].nfm; i++ ) SVisit[IsSiphon[s].fm[i]] = 1;
+}
+
+static void topSiphonLink(int l, double inflow, double up, double pk, double cv,
+                          double cc, double inf)
+//  HHU_StaticTopSiphonLink he_hydrun.cpp:863 (force main leaving a top manhole)
+{
+    int s, i;
+    if ( SVisit[l] ) return;
+    s = IsPipe[l].siphon;
+    if ( s < 0 || IsSiphon[s].type != IS_SIPHON_STANDARD ) return;
+    standardSiphonFlow(s, inflow);
+    for ( i = 0; i < IsSiphon[s].nfm; i++ )
+    {
+        int f = IsSiphon[s].fm[i];
+        SUP[f] = up;  SPK[f] = pk;  SCV[f] = cv;  SCC[f] = cc;  SINF[f] = inf;
+    }
+    for ( i = 0; i < IsSiphon[s].nfm; i++ ) SVisit[IsSiphon[s].fm[i]] = 1;
+}
+
+static double pumpFlowBisection(int pumpIndex, double siphonQ)
+//  Fc_PumpFlowBisection he_hydrun.cpp:5039
+{
+    TIsPump* pu = &IsPump[pumpIndex];
+    TIsStation* st = &IsStation[pu->station];
+    TIsWetWell* w = &IsWell[pu->wetwell];
+    int s = st->siphon, i;
+    double wellHead = w->initLevel + w->bottom;
+    double tailHead = siphonTailHead(s);
+    double loss, functX, functX1, functX11, speedCoef, adjA;
+    for (;;)
+    {
+        loss = siphonHeadloss(s, siphonQ);
+        functX = 0.0;  functX11 = 0.0;
+        for ( i = 0; i < st->npump; i++ )
+        {
+            functX1 = 0.0;
+            if ( SPumpOn[i] > 0 && isPointPump(st->pump[i]) )
+            {
+                functX = wellHead - tailHead - loss + pow(SPumpSpeed[i], 2.0)*SPumpHead0[i];
+                if ( functX < 0.0 ) break;
+                speedCoef = pow(SPumpSpeed[i], SPumpB[i] - 2.0);
+                adjA = SPumpA[i]/speedCoef;
+                functX1 = pow(functX/adjA, 1.0/SPumpB[i]);
+            }
+            functX11 += functX1;
+        }
+        if ( functX < 0.0 ) { siphonQ = 0.99*siphonQ;  continue; }
+        break;
+    }
+    SUpdatedPumpFlow = siphonQ;
+    return functX11 - siphonQ;
+}
+
+static int pointPumpFlow(int pumpIndex, double* pumpFlow)
+//  Fc_StaticGetPointPumpFlowV2 he_hydrun.cpp:4698: Newton on the station
+//  flow, bisection if Newton fails. Returns 1 on a fatal failure.
+{
+    TIsPump* pu0 = &IsPump[pumpIndex];
+    TIsStation* st = &IsStation[pu0->station];
+    TIsWetWell* w = &IsWell[pu0->wetwell];
+    int s = st->siphon, n = st->npump, i, iter = 0, maxIter = 150;
+    int parallelCount = pu0->parallel;
+    double wellHead = w->initLevel + w->bottom;
+    double tailHead = siphonTailHead(s);
+    double totalPumpHead = 0.0, limiting, sQ, loss = 0.0, newQ = 0.0, deltaFlow = 1000.0;
+    double speedCoef = 0.0, adjA = 0.0, prevFunctX = 0.0, prevQ = 0.0, tol = 0.0001;
+    double Q = 0.0, functX;
+
+    for ( i = 0; i < n; i++ )
+    {
+        int p = st->pump[i];
+        if ( SPumpOn[i] > 0 )
+        {
+            if ( isPointPump(p) ) Q += parallelCount*IsPump[p].flow1;
+            if ( SPumpSpeed[i] < 0.0 ) SPumpSpeed[i] = 1.0;
+        }
+    }
+    for ( i = 0; i < n; i++ ) totalPumpHead += pow(SPumpSpeed[i], 2.0)*SPumpHead0[i];
+    limiting = totalPumpHead - (tailHead - wellHead);
+    if ( limiting <= 0.0 )
+    {
+        for ( i = 0; i < n; i++ )
+            if ( SPumpOn[i] > 0 && isPointPump(st->pump[i]) )
+            {
+                SQ[IsNPM + st->pump[i]] = 0.0;
+                SPumpHead[st->pump[i]] = 0.0;
+            }
+        *pumpFlow = Q;
+        return 0;
+    }
+    sQ = Q;
+    while ( deltaFlow > tol && iter <= maxIter )
+    {
+        double functX11 = 0.0, functX12, functX22 = 0.0, functX23;
+        iter++;
+        for (;;)                                    // tryAgain
+        {
+            loss = siphonHeadloss(s, sQ);
+            if ( loss > limiting ) { sQ = sQ/2.0;  Q = sQ;  continue; }
+            break;
+        }
+        functX = 0.0;
+        for ( i = 0; i < n; i++ )
+        {
+            double functX1 = 0.0, functX21 = 0.0, functP, functX2;
+            int p = st->pump[i];
+            if ( SPumpOn[i] > 0 && isPointPump(p) )
+            {
+                functX = wellHead - tailHead - loss + pow(SPumpSpeed[i], 2.0)*SPumpHead0[i];
+                if ( functX < 0.0 ) break;
+                speedCoef = pow(SPumpSpeed[i], SPumpB[i] - 2.0);
+                adjA = SPumpA[i]/speedCoef;
+                functX1 = pow(functX/adjA, 1.0/SPumpB[i]);
+                functP = pow(functX/adjA, SPumpPB[i]);
+                functX2 = (1.0/SPumpB[i])*functP;
+                functX21 = functX2*(siphonNewtonFactor(s, sQ)/adjA);
+            }
+            functX11 += functX1;
+            functX22 += functX21;
+        }
+        if ( functX >= 0.0 )
+        {
+            functX12 = Q - functX11;
+            functX23 = 1 + functX22;
+            if ( fabs(functX23) <= IsFlowTol ) newQ = Q;
+            else newQ = Q - functX12/functX23;
+            if ( newQ < 0.001 )
+            {
+                for ( i = 0; i < n; i++ )
+                    if ( SPumpOn[i] > 0 && isPointPump(st->pump[i]) )
+                    {
+                        SQ[IsNPM + st->pump[i]] = 0.0;
+                        SPumpHead[st->pump[i]] = 0.0;
+                    }
+                *pumpFlow = Q;
+                return 0;
+            }
+            prevFunctX = functX;
+            deltaFlow = fabs((newQ - Q)/newQ);
+            prevQ = Q;
+            Q = newQ;
+            sQ = Q;
+        }
+        else
+        {
+            if ( Q <= 0.001 )
+            {
+                for ( i = 0; i < n; i++ )
+                    if ( SPumpOn[i] > 0 && isPointPump(st->pump[i]) )
+                    {
+                        SQ[IsNPM + st->pump[i]] = 0.0;
+                        SPumpHead[st->pump[i]] = 0.0;
+                    }
+                *pumpFlow = Q;
+                return 0;
+            }
+            if ( prevFunctX >= 0.0 )
+            {
+                Q = 0.5*(Q + prevQ);
+                prevQ = sQ;
+                deltaFlow = fabs((Q - prevQ)/Q);
+                sQ = Q;
+            }
+            else
+            {
+                Q = 0.5*Q;
+                prevQ = sQ;
+                deltaFlow = fabs((Q - prevQ)/Q);
+                sQ = Q;
+            }
+            prevFunctX = functX;
+        }
+    }
+    if ( deltaFlow > tol )                          // bisection
+    {
+        int bIter = 0;
+#ifdef ISEWER_TRACE
+        fprintf(stderr, "ISEWER_TRACE bisection pump %s\n", Link[pu0->swmm].ID);
+#endif
+        double lowerQ = IsFlowTol, upperQ = pu0->flow2, lowerF, upperF, avgQ, avgF;
+        lowerF = pumpFlowBisection(pumpIndex, lowerQ);  lowerQ = SUpdatedPumpFlow;
+        upperF = pumpFlowBisection(pumpIndex, upperQ);  upperQ = SUpdatedPumpFlow;
+        avgQ = 0.5*(lowerQ + upperQ);
+        avgF = pumpFlowBisection(pumpIndex, avgQ);      avgQ = SUpdatedPumpFlow;
+        do
+        {
+            if ( avgF*upperF <= 0.0 )
+            {
+                lowerQ = avgQ;
+                lowerF = pumpFlowBisection(pumpIndex, lowerQ);  lowerQ = SUpdatedPumpFlow;
+            }
+            else if ( avgF*lowerF <= 0.0 )
+            {
+                upperQ = avgQ;
+                upperF = pumpFlowBisection(pumpIndex, upperQ);  upperQ = SUpdatedPumpFlow;
+            }
+            else
+            {
+                upperQ = 1.01*upperQ;
+                upperF = pumpFlowBisection(pumpIndex, upperQ);  upperQ = SUpdatedPumpFlow;
+            }
+            avgQ = 0.5*(lowerQ + upperQ);
+            avgF = pumpFlowBisection(pumpIndex, avgQ);  avgQ = SUpdatedPumpFlow;
+            bIter++;
+        } while ( (fabs(avgF)/avgQ) >= 0.00001 && bIter < 200 );
+        if ( bIter >= 100 ) return 1;
+        loss = siphonHeadloss(s, avgQ);
+    }
+    functX = 0.0;
+    for ( i = 0; i < n; i++ )                       // Compute Output Data
+    {
+        int p = st->pump[i];
+        if ( SPumpOn[i] > 0 && isPointPump(p) )
+        {
+            int e = IsNPM + p;
+            functX = wellHead - tailHead - loss + pow(SPumpSpeed[i], 2.0)*SPumpHead0[i];
+            speedCoef = pow(SPumpSpeed[i], SPumpB[i] - 2.0);
+            adjA = SPumpA[i]/speedCoef;
+            SQ[e] = pow(functX/adjA, 1.0/SPumpB[i]);
+            SPumpHead[p] = pow(SPumpSpeed[i], 2.0)*SPumpHead0[i] - adjA*pow(fabs(SQ[e]), SPumpB[i]);
+            SPumpHead[p] = MAX(0.0, SPumpHead[p]);
+        }
+    }
+    *pumpFlow = Q;
+    return 0;
+}
+
+static int stationFlow(int link, double up, double pk, double cv, double cc,
+                       double inf)
+//  Fc_StaticGetStationFlowV2 he_hydrun.cpp:4365. Returns 1 on a fatal failure.
+{
+    TIsStation* st = &IsStation[IsPipe[link].station];
+    int n = st->npump, i, numOff = 0;
+    TIsWetWell* w = &IsWell[st->wetwell];
+    double totalCap = 0.0, totalInflow, wellHead, bottomElev;
+
+    for ( i = 0; i < n; i++ )
+    {
+        SPumpHead0[i] = SPumpA[i] = SPumpB[i] = SPumpPB[i] = 0.0;
+        SPumpOn[i] = 1;  SPumpSpeed[i] = 1.0;
+    }
+    totalInflow = up + pk + cv + inf + 0.0;
+    wellHead = w->initLevel + w->bottom;
+    bottomElev = w->bottom;
+    if ( wellHead <= bottomElev && totalInflow <= IsFlowTol )
+        for ( i = 0; i < n; i++ ) SPumpOn[i] = 0;
+    for ( i = 0; i < n; i++ )                      // pumps off by usage or speed
+    {
+        int p = st->pump[i], e = IsNPM + p;
+        double usage = 1.0;
+        SPumpSpeed[i] = IsPump[p].speed;
+        if ( SPumpSpeed[i] < IS_SYS_ZERO ) usage = 0.0;
+        if ( usage < IS_SYS_ZERO )
+        {
+            SQ[e] = SUP[e] = SPK[e] = SCV[e] = SCC[e] = SINF[e] = 0.0;
+            SPumpHead[p] = 0.0;
+            SPumpOn[i] = 0;
+            numOff += 1;
+        }
+    }
+    if ( numOff < n )
+    {
+        for ( i = 0; i < n; i++ )
+        {
+            int p = st->pump[i], e = IsNPM + p;
+            if ( SPumpOn[i] > 0 && IsPump[p].type == IS_PUMP_CAPACITY )
+            {
+                double totalFlow;
+                SQ[e] = IsPump[p].capacity;
+                totalCap += IsPump[p].parallel*SQ[e];
+                totalFlow = IsPump[p].parallel*SQ[e];
+                SPumpHead[p] = siphonTailHead(st->siphon) + siphonHeadloss(st->siphon, totalFlow) - wellHead;
+                SPumpHead[p] = MAX(0.0, SPumpHead[p]);
+            }
+        }
+        if ( isPointPump(st->pump[n - 1]) )
+        {
+            double pumpQ = 0.0;
+            for ( i = 0; i < n; i++ )
+            {
+                int p = st->pump[i];
+                if ( SPumpOn[i] > 0 )
+                {
+                    SPumpHead0[i] = IsPump[p].head0;
+                    SPumpA[i] = IsPump[p].a;
+                    SPumpB[i] = IsPump[p].b;
+                    SPumpPB[i] = (1.0/SPumpB[i]) - 1.0;
+                }
+            }
+            if ( pointPumpFlow(st->pump[0], &pumpQ) ) return 1;
+            totalCap = pumpQ;
+        }
+    }
+    if ( IsPumpContinuity == 0 )
+    {
+        SUP[link] = up;  SPK[link] = pk;  SCV[link] = cv;  SCC[link] = cc;  SINF[link] = inf;
+    }
+    else
+    {
+        SUP[link] = totalCap;
+        SPK[link] = SCV[link] = SCC[link] = SINF[link] = 0.0;
+    }
+    SVisit[link] = 1;
+    return 0;
+}
+
 static void steadySolve(void)
 //  Fv_StaticRun he_staticrun.cpp:344, then Fv_GetPipeHydraulic,
 //  Fv_GetCriticalDepth, Fv_GetPipeFlowDepth, Fv_StaticFilterResult, He_RunHead.
 {
-    int i, k, m, N = Nobjects[NODE], L = Nobjects[LINK];
+    int i, k, m, N = IsNN, LE = IsNLE, maxPumps = 1;
     int *visit;
     double *Q;
 
-    SQ  = (double*) calloc(L + 1, sizeof(double));
-    SUP = (double*) calloc(L + 1, sizeof(double));
-    SPK = (double*) calloc(L + 1, sizeof(double));
-    SCV = (double*) calloc(L + 1, sizeof(double));
-    SCC = (double*) calloc(L + 1, sizeof(double));
-    SINF = (double*) calloc(L + 1, sizeof(double));
-    SDepth = (double*) calloc(L + 1, sizeof(double));
-    SVel = (double*) calloc(L + 1, sizeof(double));
-    SCrit = (double*) calloc(L + 1, sizeof(double));
-    SFull = (int*) calloc(L + 1, sizeof(int));
-    SFtype = (int*) calloc(L + 1, sizeof(int));
-    SPartial = (int*) calloc(L + 1, sizeof(int));
-    SAdjFull = (int*) calloc(L + 1, sizeof(int));
+    for ( i = 0; i < IsNStation; i++ ) maxPumps = MAX(maxPumps, IsStation[i].npump);
+    SQ  = (double*) calloc(LE + 1, sizeof(double));
+    SUP = (double*) calloc(LE + 1, sizeof(double));
+    SPK = (double*) calloc(LE + 1, sizeof(double));
+    SCV = (double*) calloc(LE + 1, sizeof(double));
+    SCC = (double*) calloc(LE + 1, sizeof(double));
+    SINF = (double*) calloc(LE + 1, sizeof(double));
+    SDepth = (double*) calloc(LE + 1, sizeof(double));
+    SVel = (double*) calloc(LE + 1, sizeof(double));
+    SCrit = (double*) calloc(LE + 1, sizeof(double));
+    SFull = (int*) calloc(LE + 1, sizeof(int));
+    SFtype = (int*) calloc(LE + 1, sizeof(int));
+    SPartial = (int*) calloc(LE + 1, sizeof(int));
+    SAdjFull = (int*) calloc(LE + 1, sizeof(int));
     SStatic = (double*) calloc(N + 1, sizeof(double));
     SHead = (double*) calloc(N + 1, sizeof(double));
     SInc = (double*) calloc(N + 1, sizeof(double));
-    visit = (int*) calloc(L + 1, sizeof(int));
+    SFmLoss = (double*) calloc(IsNF + 1, sizeof(double));
+    SPumpHead = (double*) calloc(IsNPump + 1, sizeof(double));
+    SWellHead = (double*) calloc(IsNWell + 1, sizeof(double));
+    SPumpHead0 = (double*) calloc(maxPumps, sizeof(double));
+    SPumpA = (double*) calloc(maxPumps, sizeof(double));
+    SPumpB = (double*) calloc(maxPumps, sizeof(double));
+    SPumpPB = (double*) calloc(maxPumps, sizeof(double));
+    SPumpOn = (double*) calloc(maxPumps, sizeof(double));
+    SPumpSpeed = (double*) calloc(maxPumps, sizeof(double));
+    visit = (int*) calloc(LE + 1, sizeof(int));
     if ( !SQ || !SUP || !SPK || !SCV || !SCC || !SINF || !SDepth || !SVel ||
          !SCrit || !SFull || !SFtype || !SPartial || !SAdjFull || !SStatic ||
-         !SHead || !SInc || !visit )
+         !SHead || !SInc || !SFmLoss || !SPumpHead || !SWellHead || !SPumpHead0 ||
+         !SPumpA || !SPumpB || !SPumpPB || !SPumpOn || !SPumpSpeed || !visit )
     {
         FREE(visit);
         report_writeErrorMsg(ERR_MEMORY, "");
         return;
     }
     Q = SQ;
+    SVisit = visit;
 
     // --- flows, upstream to downstream
     for ( m = 0; m < IsNorder; m++ )
@@ -1083,20 +2245,22 @@ static void steadySolve(void)
         double up, pk, cv, cc, inf, inflow;
         k = IsOrder[m];
         nd = &IsNode[k];
-        if ( nd->nconn == 1 && !nd->isOutlet )
+        if ( nd->nconn == 1 && nd->kind == IS_NODE_LOAD )
         {
             // Fv_GetSingleSourceNodeFlow he_staticrun.cpp:423
             int l = nd->conn[0];
             SStatic[k] = staticTotal(k);
             staticGetLoading(k, &SUP[l], &SPK[l], &SCV[l], &SCC[l], &SINF[l]);
             Q[l] = SUP[l] + peakFlow(SPK[l]) + coverFlow(SCV[l], SCC[l]) + 0.0;
+            if ( IsPipe[l].kind == IS_LINK_FM )
+                topSiphonLink(l, Q[l], SUP[l], SPK[l], SCV[l], SCC[l], SINF[l]);
             visit[l] = 1;
             continue;
         }
 
         // Fv_GetConnectNodeFlow he_staticrun.cpp:518
         up = pk = cv = cc = inf = 0.0;
-        if ( !nd->isOutlet )
+        if ( nd->kind == IS_NODE_LOAD )
         {
             SStatic[k] = staticTotal(k);
             staticGetLoading(k, &up, &pk, &cv, &cc, &inf);
@@ -1110,7 +2274,8 @@ static void steadySolve(void)
             }
         }
         inflow = up + peakFlow(pk) + coverFlow(cv, cc) + 0.0;
-        if ( fabs(inflow) < IsFlowTol )
+        if ( fabs(inflow) < IsFlowTol && nd->kind != IS_NODE_WETWELL &&
+             nd->kind != IS_NODE_CHAMBER )
         {
             // QUIRK: the loop starts at the second downstream link (he_staticrun.cpp:609)
             for ( i = 1; i < nd->ndown; i++ )
@@ -1124,9 +2289,20 @@ static void steadySolve(void)
         if ( nd->ndown == 1 )                     // HHU_StaticSingleDownLink
         {
             int l = nd->down[0];
-            Q[l] = inflow;  SUP[l] = up;  SPK[l] = pk;  SCV[l] = cv;  SCC[l] = cc;
-            SINF[l] = inf;
-            visit[l] = 1;
+            if ( IsPipe[l].kind == IS_LINK_PIPE )
+            {
+                Q[l] = inflow;  SUP[l] = up;  SPK[l] = pk;  SCV[l] = cv;  SCC[l] = cc;
+                SINF[l] = inf;
+                visit[l] = 1;
+            }
+            else if ( IsPipe[l].kind == IS_LINK_FM )
+                siphonFlow(l, inflow, up, pk, cv, cc, inf);
+            else if ( stationFlow(l, up, pk, cv, cc, inf) )
+            {
+                report_writeErrorMsg(ERR_ISEWER_PUMPFLOW, linkId(l));
+                FREE(visit);
+                return;
+            }
         }
         else if ( nd->ndown > 1 )
         {
@@ -1142,13 +2318,12 @@ static void steadySolve(void)
         }
     }
     FREE(visit);
+    SVisit = NULL;
 
-    // --- Fv_GetPipeHydraulic he_staticrun.cpp:681
-    for ( i = 0; i < L; i++ )
+    // --- gravity pipe hydraulics (he_staticrun.cpp:681-904, gravity pipes only)
+    for ( i = 0; i < IsNP; i++ )                   // Fv_GetPipeHydraulic
         SFull[i] = (Q[i] > IsFlowTol && Q[i] >= IsPipe[i].fullFlow);
-
-    // --- Fv_GetCriticalDepth he_staticrun.cpp:732
-    for ( i = 0; i < L; i++ )
+    for ( i = 0; i < IsNP; i++ )                   // Fv_GetCriticalDepth
     {
         if ( fabs(Q[i]) < IsFlowTol ) SCrit[i] = 0.0;
         else
@@ -1157,9 +2332,7 @@ static void steadySolve(void)
             SCrit[i] = isewer_criticalDepth(i, q, IsPipe[i].dia);
         }
     }
-
-    // --- Fv_GetPipeFlowDepth he_staticrun.cpp:776
-    for ( i = 0; i < L; i++ )
+    for ( i = 0; i < IsNP; i++ )                   // Fv_GetPipeFlowDepth
     {
         double q = Q[i] / IsPipe[i].count;
         SDepth[i] = SFull[i] ? IsPipe[i].dia : isewer_flowDepth(i, q);
@@ -1168,9 +2341,7 @@ static void steadySolve(void)
                                           MIN(q, Q[i] / IsPipe[i].count));
         else SVel[i] = 0.0;
     }
-
-    // --- Fv_StaticFilterResult he_staticrun.cpp:878
-    for ( i = 0; i < L; i++ )
+    for ( i = 0; i < IsNP; i++ )                   // Fv_StaticFilterResult
     {
         if ( !(SDepth[i] / IsPipe[i].dia >= IS_DD_TOL) )
         {
@@ -1179,8 +2350,12 @@ static void steadySolve(void)
         }
     }
 
-    // --- heads
-    isewer_runHead(Q, SDepth, SHead, SFtype, SPartial, SAdjFull, 1);
+    // --- heads (Fv_StaticGetHead he_staticrun.cpp:905): wet wells at their
+    //     initial level
+    for ( i = 0; i < IsNWell; i++ ) SWellHead[i] = IsWell[i].initLevel + IsWell[i].bottom;
+    isewer_setHeadPressureData(SWellHead, SPumpHead);
+    if ( isewer_runHead(Q, SDepth, SHead, SFtype, SPartial, SAdjFull, 1) && !ErrorCode )
+        report_writeErrorMsg(ERR_ISEWER_LINK, "(head sweep)");
 }
 
 static void splitLinks(int k, double inflow, double* Q, int* visit)
@@ -1309,50 +2484,98 @@ static void multiHydSplit(int* hyd, int nhyd, double qh, double* Q, int* visit)
 //  HGL sweep (He_RunHead, he_runhead.cpp) - shared by steady state and EPS
 //=============================================================================
 
-static const double* HQ;      // link flows (cfs)
-static const double* HY;      // link depths (ft)
+static const double* HQ;      // link flows (cfs), link element indexes
+static const double* HY;      // gravity pipe depths (ft)
+static const double* HWell;   // wet well heads (ft)
+static const double* HPumpH;  // pump head increases (ft)
 static double* HHyd;          // working node heads
 static double* HOut;          // output node heads
-static int*    HLevel;        // upstream pipes done per node
+static int*    HLevel;        // upstream links done per node
 static int*    HFtype;
 static int*    HPartial;
 static int*    HAdjFull;
 static int*    HSplitOrder;   // order in which split nodes were reached
 static int*    HSplitNode;    // node for each split order
+static int*    HFmFlag;       // force main heads done (mv_pForceMainFlag)
 static int     HCounter;
+static int     HError;
+
+void isewer_setHeadPressureData(const double* wellHead, const double* pumpHead)
+//  F_SetWetWellHead, F_SetPumpHead he_runhead.cpp:270, 483
+{
+    HWell = wellHead;
+    HPumpH = pumpHead;
+}
 
 static int fully(int k) { return HLevel[k] == IsNode[k].nuph; }
 
-static void adjustNode(int k, double h)
-//  Fv_AdjustNodeHead he_runhead.cpp:1910 (load manhole / flow split)
+static void minorLoss(int k, double* h)
+//  Fv_AdjustNodeMinorLoss he_runhead.cpp:2258: full-pipe velocity of the
+//  total flow of each flowing downstream link; K from the SWMM inlet loss.
+//  Force mains use Q/(3.14 r^2).
 {
     TIsNode* nd = &IsNode[k];
     int m;
-    double dh = -IS_BIG;
-    // Fv_AdjustLoadNodeDownstream he_runhead.cpp:2152
-    // QUIRK: h = max(h, dh) runs for every pipe, with dh kept from the last
-    // flowing one.
-    for ( m = 0; m < nd->ndown; m++ )
-    {
-        int l = nd->down[m];
-        if ( HQ[l] > IS_FLOW_TOL ) dh = HY[l] + IsPipe[l].fromInv;
-        h = MAX(h, dh);
-    }
-    // Fv_AdjustNodeMinorLoss he_runhead.cpp:2258: full-pipe velocity of the
-    // total flow of each flowing downstream pipe; K from the SWMM inlet loss
     for ( m = 0; m < nd->ndown; m++ )
     {
         int l = nd->down[m];
         if ( HQ[l] > IS_FLOW_TOL )
         {
-            double D = IsPipe[l].dia;
-            double v = isewer_pipeVelocity(D, 0.5 * D, HQ[l]);
-            h += IsPipe[l].kLoss * ((v * v) / (2.0 * 32.174));
+            double D = IsPipe[l].dia, v;
+            if ( IsPipe[l].kind == IS_LINK_PIPE )
+                v = isewer_pipeVelocity(D, 0.5 * D, HQ[l]);
+            else if ( IsPipe[l].kind == IS_LINK_FM )
+            {
+                double r = 0.5 * D;
+                v = HQ[l] / (3.14 * r * r);
+            }
+            else continue;
+            *h += fabs(IsPipe[l].kLoss) * ((v * v) / (2.0 * 32.174));
         }
     }
-    if ( nd->split ) HHyd[k] = MAX(HHyd[k], h);
-    else             HHyd[k] = h;
-    HOut[k] = MIN(HHyd[k], nd->cap);   // unlocked: cap = rim
+}
+
+static void adjustNode(int k, double h)
+//  Fv_AdjustNodeHead he_runhead.cpp:1910
+{
+    TIsNode* nd = &IsNode[k];
+    int m;
+    double dh = -IS_BIG;
+    switch ( nd->kind )
+    {
+      case IS_NODE_LOAD:
+        // Fv_AdjustLoadNodeDownstream he_runhead.cpp:2152
+        // QUIRK: h = max(h, dh) runs for every link, with dh kept from the
+        // last flowing one.
+        for ( m = 0; m < nd->ndown; m++ )
+        {
+            int l = nd->down[m];
+            if ( HQ[l] > IS_FLOW_TOL )
+            {
+                if ( IsPipe[l].kind == IS_LINK_PIPE ) dh = HY[l] + IsPipe[l].fromInv;
+                else if ( IsPipe[l].kind == IS_LINK_FM ) dh = IsPipe[l].dia + IsPipe[l].fromInv;
+            }
+            h = MAX(h, dh);
+        }
+        minorLoss(k, &h);
+        if ( nd->split ) HHyd[k] = MAX(HHyd[k], h);
+        else             HHyd[k] = h;
+        HOut[k] = MIN(HHyd[k], nd->cap);   // unlocked: cap = rim
+        break;
+
+      case IS_NODE_CHAMBER:
+        minorLoss(k, &h);
+        HOut[k] = h;
+        break;
+
+      case IS_NODE_WETWELL:
+        HOut[k] = HWell[nd->wetwell];      // head is not carried upstream
+        break;
+
+      default:
+        HError = 1;
+        return;
+    }
     HHyd[k] = HOut[k];
 }
 
@@ -1397,6 +2620,8 @@ static double adjustPipe(int l, double dh, double uh)
 
 static void pipeHead(int l, int uk, double dh)
 //  Fv_GetPipeHead he_runhead.cpp:1404 (circular)
+//  QUIRK: zero flow "by invert" reads hm_pLoadNode[upstream node index]; the
+//  node and load node indexes agree for load manholes, which come first.
 {
     TIsPipe* p = &IsPipe[l];
     double uh, dH, ref, ui, di, D, dd;
@@ -1441,6 +2666,63 @@ static void pipeHead(int l, int uk, double dh)
     HFtype[l] = (uh >= (p->fromInv + p->dia + IS_DEPTH_TOL)) ? 1 : 0;
 }
 
+static void forceMainHead(int l, double dh)
+//  Fv_GetForceMainHead he_runhead.cpp:1722: heads along the whole siphon
+//  chain, from its tail up.
+{
+    int s, i, nfm;
+    double ref = dh, stationFlow = 0.0, linkFlow;
+    if ( HFmFlag[l - IsNP] ) return;
+    s = IsPipe[l].siphon;
+    if ( s < 0 ) { HError = 1;  return; }
+    nfm = IsSiphon[s].nfm;
+    if ( IsSiphon[s].type == IS_SIPHON_STATION )
+    {
+        TIsStation* st = &IsStation[IsSiphon[s].station];
+        double stationHead = HPumpH[st->pump[0]];
+        double siphonHead, down;
+        stationFlow = HQ[l];               // flow of the force main given
+        siphonHead = siphonHeadloss(s, stationFlow);
+        down = HWell[st->wetwell] + stationHead - siphonHead;
+        if ( down > dh )
+        {
+            adjustNode(IsPipe[IsSiphon[s].fm[nfm - 1]].to, down);
+            ref = down;
+        }
+    }
+    linkFlow = stationFlow;
+    for ( i = nfm - 1; i >= 0; i-- )
+    {
+        int f = IsSiphon[s].fm[i], uk = IsPipe[f].frm;
+        double uh;
+        if ( IsSiphon[s].type == IS_SIPHON_STANDARD ) linkFlow = HQ[f];
+        uh = ref + fmHeadloss(f, linkFlow);
+        if ( linkFlow > IS_FLOW_TOL ) uh = MAX(uh, IsPipe[f].fromInv + IsPipe[f].dia);
+        else uh = IsPipe[f].fromInv;       // zero flow by invert
+        adjustNode(uk, uh);
+        ref = HHyd[uk];
+        HFmFlag[f - IsNP] = 1;
+    }
+}
+
+static void stationHead(int l, double dh)
+//  Fv_GetStationHead he_runhead.cpp:1871
+{
+    TIsStation* st = &IsStation[IsPipe[l].station];
+    adjustNode(st->frm, dh - HPumpH[st->pump[0]]);
+}
+
+static void nodeHead(int l, int uk, double dh)
+//  Fv_GetNodeHead he_runhead.cpp:1353
+{
+    switch ( IsPipe[l].kind )
+    {
+      case IS_LINK_PIPE: pipeHead(l, uk, dh);  break;
+      case IS_LINK_FM:   forceMainHead(l, dh); break;
+      default:           stationHead(l, dh);   break;
+    }
+}
+
 static void depthSearch(int k)
 //  Fv_DepthSearch he_runhead.cpp:1162. A split node is suspended here and
 //  resumed level by level from isewer_runHead.
@@ -1462,7 +2744,7 @@ static void depthSearch(int k)
     {
         int l = nd->uph[m];
         int nk = IsPipe[l].frm;
-        pipeHead(l, nk, HHyd[k]);               // Fv_GetNodeHead
+        nodeHead(l, nk, HHyd[k]);
         HLevel[k]++;
         depthSearch(nk);
     }
@@ -1478,34 +2760,37 @@ static void splitDepthSearch(int k)
     {
         int l = nd->uph[m];
         int nk = IsPipe[l].frm;
-        pipeHead(l, nk, HHyd[k]);
+        nodeHead(l, nk, HHyd[k]);
         HLevel[k]++;
         depthSearch(nk);
     }
 }
 
-void isewer_runHead(const double* Q, const double* y, double* head,
-                    int* ftype, int* partial, int* adjFull, int resetFtype)
+int isewer_runHead(const double* Q, const double* y, double* head,
+                   int* ftype, int* partial, int* adjFull, int resetFtype)
 //  He_RunHead::F_Run he_runhead.cpp:554. Heads from each outlet upstream.
+//  Returns 1 if the engine's sweep would fail (F_Run false).
 //  QUIRK: nested flow splits can leave a stale head upstream of a split.
 //  QUIRK: in EPS the flow type flags are never reset between report times
 //  (resetFtype = 0); a pipe the sweep does not reach keeps its old flag.
 {
-    int k, i, N = Nobjects[NODE], L = Nobjects[LINK];
+    int k, i, N = IsNN;
     int nsplit = 0, remain, start, end, tmpStart;
     double ff;
 
     HQ = Q;  HY = y;  HOut = head;
     HFtype = ftype;  HPartial = partial;  HAdjFull = adjFull;
+    HError = 0;
     HHyd = (double*) calloc(N + 1, sizeof(double));
     HLevel = (int*) calloc(N + 1, sizeof(int));
     HSplitOrder = (int*) calloc(N + 1, sizeof(int));
     HSplitNode = (int*) calloc(N + 1, sizeof(int));
-    if ( !HHyd || !HLevel || !HSplitOrder || !HSplitNode )
+    HFmFlag = (int*) calloc(IsNF + 1, sizeof(int));
+    if ( !HHyd || !HLevel || !HSplitOrder || !HSplitNode || !HFmFlag )
     {
-        FREE(HHyd); FREE(HLevel); FREE(HSplitOrder); FREE(HSplitNode);
+        FREE(HHyd); FREE(HLevel); FREE(HSplitOrder); FREE(HSplitNode); FREE(HFmFlag);
         report_writeErrorMsg(ERR_MEMORY, "");
-        return;
+        return 1;
     }
     for ( k = 0; k < N; k++ )
     {
@@ -1514,23 +2799,24 @@ void isewer_runHead(const double* Q, const double* y, double* head,
         HSplitOrder[k] = -1;
         if ( IsNode[k].split ) nsplit++;
     }
-    for ( i = 0; i < L; i++ )
+    for ( i = 0; i < IsNP; i++ )
     {
         if ( resetFtype ) HFtype[i] = 0;
         HPartial[i] = 0;  HAdjFull[i] = 0;
     }
     HCounter = 0;
 
-    for ( k = 0; k < N; k++ )
+    for ( k = 0; k < N && !HError; k++ )
     {
         TIsNode* nd = &IsNode[k];
         int m;
-        if ( !nd->isOutlet ) continue;
+        if ( nd->kind != IS_NODE_OUTLET ) continue;
         // Fv_GetOutletHead he_runhead.cpp:1296
         ff = -IS_BIG;
         for ( m = 0; m < nd->nuph; m++ )
         {
             int l = nd->uph[m];
+            if ( IsPipe[l].kind != IS_LINK_PIPE ) { HError = 1;  break; }
             ff = MAX(ff, HY[l] + IsPipe[l].toInv);
         }
         HHyd[k] = MAX(nd->submerge, ff);
@@ -1541,7 +2827,7 @@ void isewer_runHead(const double* Q, const double* y, double* head,
     // --- split nodes, level by level (QUIRK: remain counts levels)
     remain = nsplit;
     start = 0;
-    while ( remain > 0 )
+    while ( remain > 0 && !HError )
     {
         tmpStart = HCounter;
         end = HCounter;
@@ -1550,7 +2836,8 @@ void isewer_runHead(const double* Q, const double* y, double* head,
         remain--;
         start = tmpStart;
     }
-    FREE(HHyd); FREE(HLevel); FREE(HSplitOrder); FREE(HSplitNode);
+    FREE(HHyd); FREE(HLevel); FREE(HSplitOrder); FREE(HSplitNode); FREE(HFmFlag);
+    return HError;
 }
 
 //=============================================================================
@@ -1560,7 +2847,15 @@ void isewer_runHead(const double* Q, const double* y, double* head,
 static void setLinkState(int j, double q, double y)
 {
     int k = Link[j].subIndex;
-    double a = (y > 0.0) ? xsect_getAofY(&Link[j].xsect, y) : 0.0;
+    double a;
+    if ( Link[j].type != CONDUIT )
+    {
+        Link[j].newFlow = q;
+        Link[j].newDepth = 0.0;
+        Link[j].newVolume = 0.0;
+        return;
+    }
+    a = (y > 0.0) ? xsect_getAofY(&Link[j].xsect, y) : 0.0;
     Link[j].newFlow = q;
     Link[j].newDepth = y;
     Conduit[k].q1 = Conduit[k].q2 = q / Conduit[k].barrels;
@@ -1573,26 +2868,46 @@ static void setNodeState(int j, double head)
     double y = head - Node[j].invertElev;
     if ( y < 0.0 ) y = 0.0;
     Node[j].newDepth = y;
-    Node[j].newVolume = 0.0;
+    Node[j].newVolume = (Node[j].type == STORAGE) ? node_getVolume(j, y) : 0.0;
     Node[j].overflow = 0.0;
+}
+
+static double steadyLinkFlow(int j, double* depth)
+//  InfoSewer steady flow (cfs) and depth (ft) of SWMM link j. A force main
+//  runs full. A pump carries its element flow; a capacity pump's element
+//  flow is one unit (station total = parallel x capacity), a curve pump's is
+//  the flow of all its parallel units (head = head0 - a*Q^b, a built on
+//  parallel x flow1).
+{
+    int l = IsLinkOfSwmm[j];
+    if ( l < IsNP ) { *depth = SDepth[l];  return MAX(SQ[l], 0.0); }
+    if ( l < IsNPM ) { *depth = IsPipe[l].dia;  return MAX(SQ[l], 0.0); }
+    *depth = 0.0;
+    {
+        TIsPump* pu = &IsPump[l - IsNPM];
+        double q = MAX(SQ[l], 0.0);
+        if ( pu->type == IS_PUMP_CAPACITY ) q *= pu->parallel;
+        return q;
+    }
 }
 
 static void setSteadyState(void)
 //  Steady state: SWMM carries the InfoSewer solution unchanged at every step.
-//  Each manhole receives a lateral inflow equal to InfoSewer's flow increment
+//  Each node receives a lateral inflow equal to InfoSewer's flow increment
 //  there (outflow - inflow, negative where peaking lowers a combined flow),
 //  so SWMM's continuity closes on the peaked flows.
 {
     int i, j;
+    double y, q;
     for ( j = 0; j < Nobjects[NODE]; j++ ) SInc[j] = 0.0;
     for ( i = 0; i < Nobjects[LINK]; i++ )
     {
-        double q = MAX(SQ[i], 0.0);
-        setLinkState(i, q, SDepth[i]);
-        if ( !IsNode[IsPipe[i].frm].isOutlet ) SInc[IsPipe[i].frm] += q;
-        if ( !IsNode[IsPipe[i].to].isOutlet )  SInc[IsPipe[i].to]  -= q;
+        q = steadyLinkFlow(i, &y);
+        setLinkState(i, q, y);
+        if ( Node[Link[i].node1].type != OUTFALL ) SInc[Link[i].node1] += q;
+        if ( Node[Link[i].node2].type != OUTFALL ) SInc[Link[i].node2] -= q;
     }
-    for ( j = 0; j < Nobjects[NODE]; j++ ) setNodeState(j, SHead[j]);
+    for ( j = 0; j < Nobjects[NODE]; j++ ) setNodeState(j, SHead[IsNodeOfSwmm[j]]);
 }
 
 void isewer_addLoads(DateTime currentDate)
@@ -1622,6 +2937,7 @@ int isewer_execute(int links[], double tStep)
 //  current step and the node inflow/outflow totals SWMM's mass balance uses.
 {
     int i, j;
+    double y;
     (void)links;  (void)tStep;
     if ( !IsNode ) return 0;
     if ( IsAnalysis == IS_EPS )
@@ -1631,11 +2947,12 @@ int isewer_execute(int links[], double tStep)
         isewer_epsNodeFlows();
         return 1;
     }
-    else
+    for ( i = 0; i < Nobjects[LINK]; i++ )
     {
-        for ( i = 0; i < Nobjects[LINK]; i++ ) setLinkState(i, MAX(SQ[i], 0.0), SDepth[i]);
-        for ( j = 0; j < Nobjects[NODE]; j++ ) setNodeState(j, SHead[j]);
+        double q = steadyLinkFlow(i, &y);
+        setLinkState(i, q, y);
     }
+    for ( j = 0; j < Nobjects[NODE]; j++ ) setNodeState(j, SHead[IsNodeOfSwmm[j]]);
     for ( i = 0; i < Nobjects[LINK]; i++ )
     {
         Node[Link[i].node1].outflow += Link[i].newFlow;
@@ -1645,12 +2962,19 @@ int isewer_execute(int links[], double tStep)
 }
 
 double isewer_getVelocity(int j, double flow, double depth)
-//  Velocity as InfoSewer computes it (per barrel flow over the 3.1416 circle
-//  area; HHU_GetPipeVelocity), used by link_getVelocity for SWMM's .out and
-//  report statistics.
+//  Velocity as InfoSewer computes it, used by link_getVelocity for SWMM's
+//  .out and report statistics. Gravity pipes: per barrel flow over the
+//  3.1416 circle area (HHU_GetPipeVelocity). Force mains: flow over the
+//  3.1415926 full area (F_GetHydraulicData).
 {
-    int k = Link[j].subIndex;
+    int k = Link[j].subIndex, l = IsLinkOfSwmm ? IsLinkOfSwmm[j] : j;
     double r = 0.5 * Link[j].xsect.yFull;
+    if ( Link[j].xsect.type == FORCE_MAIN )
+    {
+        double D = Link[j].xsect.yFull;
+        if ( IsAnalysis == IS_STEADY && SVel ) return SVel[l];
+        return flow / (0.25 * IS_PI_DEF * D * D);
+    }
     if ( depth <= 0.0 ) return 0.0;
     if ( depth > Link[j].xsect.yFull ) depth = Link[j].xsect.yFull;
     return isewer_pipeVelocity(depth, r, flow / Conduit[k].barrels);
@@ -1717,17 +3041,54 @@ static double nodeBase(int k)
 
 static int nodeJump(int k, double* fr)
 //  he_staticrun.cpp:1326-1369: supercritical upstream, subcritical downstream
+//  (gravity pipes only)
 {
     int m, upSuper = 0;
-    for ( m = 0; m < IsNode[k].nup; m++ ) if ( fr[IsNode[k].up[m]] > 1 ) upSuper = 1;
+    for ( m = 0; m < IsNode[k].nup; m++ )
+    {
+        int l = IsNode[k].up[m];
+        if ( IsPipe[l].kind == IS_LINK_PIPE && fr[l] > 1 ) { upSuper = 1;  break; }
+    }
     if ( !upSuper ) return 0;
-    for ( m = 0; m < IsNode[k].ndown; m++ ) if ( fr[IsNode[k].down[m]] < 1 ) return 1;
+    for ( m = 0; m < IsNode[k].ndown; m++ )
+    {
+        int l = IsNode[k].down[m];
+        if ( IsPipe[l].kind == IS_LINK_PIPE && fr[l] < 1 ) return 1;
+    }
     return 0;
 }
 
+static double outletFlow(int k)
+//  Fv_GetOutletFlow: sums the UNclipped flows of the links into the outlet
+{
+    int i;
+    double q = 0.0;
+    for ( i = 0; i < IsNPM; i++ ) if ( IsPipe[i].to == k ) q += SQ[i];
+    return q;
+}
+
+static double pumpOut(int p, int what)
+//  Fv_PumpData he_staticrun.cpp:1681: 0 flow, 1 head, 2 power (hp),
+//  3 usage, 4 speed
+{
+    double q = SQ[IsNPM + p], h = SPumpHead[p];
+    int on = fabs(q) > 1.0e-7;
+    switch ( what )
+    {
+      case 0:  return q;
+      case 1:  return h;
+      case 2:  return on ? MAX(0.0, q * h * (62.4 / 550.0)) : 0.0;
+      case 3:  return on ? (double)IsPump[p].parallel : 0.0;
+      default: return on ? IsPump[p].speed : 0.0;
+    }
+}
+
+#define NODE_ID(k)  Node[IsNode[k].swmm].ID
+#define LINK_ID(l)  Link[IsPipe[l].swmm].ID
+
 static void writeSteadyReport(void)
 {
-    int i, k, L = Nobjects[LINK], N = Nobjects[NODE];
+    int i, k, N = IsNN;
     double ff = IsFlowFactor, lf = UCF(LENGTH);
     TIsPipeOut o;
     FILE* f = Frpt.file;
@@ -1745,17 +3106,52 @@ static void writeSteadyReport(void)
 "\n  Pipe                    Flow       Flow       Flow       Flow       Flow     %-6s                            "
 "\n  ------------------------------------------------------------------------------------------------------------",
     UnitSystem == US ? "ft/s" : "m/s");
-    for ( i = 0; i < L; i++ )
+    for ( i = 0; i < IsNP; i++ )
     {
         pipeOutputs(i, &o);
         fprintf(f, "\n  %-16s %10.4f %10.4f %10.4f %10.4f %10.4f %10.3f %9.3f %10.3f   %s",
-            Link[i].ID, o.flow * ff, o.unpeak * ff, o.peak * ff, o.cover * ff,
+            LINK_ID(i), o.flow * ff, o.unpeak * ff, o.peak * ff, o.cover * ff,
             o.infil * ff, o.vel * lf, o.dD, o.qQ, o.flowtype > 0 ? "YES" : "no");
     }
+    if ( IsNF > 0 )
+    {
+        fprintf(f,
+"\n\n  *****************************************"
+"\n  InfoSewer Steady-State Force Main Results"
+"\n  *****************************************\n");
+        fprintf(f,
+"\n  ---------------------------------------------------------------------------------------"
+"\n                         Total     Unpeak       Peak      Cover      Infil   Velocity  Headloss"
+"\n  Force Main              Flow       Flow       Flow       Flow       Flow     %-6s     %-4s"
+"\n  ---------------------------------------------------------------------------------------",
+        UnitSystem == US ? "ft/s" : "m/s", UnitSystem == US ? "ft" : "m");
+        for ( i = IsNP; i < IsNPM; i++ )
+            fprintf(f, "\n  %-16s %10.4f %10.4f %10.4f %10.4f %10.4f %10.3f %9.3f",
+                LINK_ID(i), SQ[i] * ff, (SUP[i] - SINF[i]) * ff, SPK[i] * ff,
+                SCV[i] * ff, SINF[i] * ff, SVel[i] * lf, SFmLoss[i - IsNP] * lf);
+    }
+    if ( IsNPump > 0 )
+    {
+        fprintf(f,
+"\n\n  ***********************************"
+"\n  InfoSewer Steady-State Pump Results"
+"\n  ***********************************"
+"\n  Curve pump flow is for all parallel units; capacity pump flow is per unit.\n");
+        fprintf(f,
+"\n  -----------------------------------------------------------------------"
+"\n                         Flow       Head      Power    Units      Speed"
+"\n  Pump               %9s     %6s         hp"
+"\n  -----------------------------------------------------------------------",
+        FlowUnitWords[FlowUnits], UnitSystem == US ? "ft" : "m");
+        for ( i = 0; i < IsNPump; i++ )
+            fprintf(f, "\n  %-16s %10.4f %10.3f %10.3f %8.0f %10.3f", Link[IsPump[i].swmm].ID,
+                pumpOut(i, 0) * ff, pumpOut(i, 1) * lf, pumpOut(i, 2), pumpOut(i, 3),
+                pumpOut(i, 4));
+    }
     fprintf(f,
-"\n\n  ************************************"
+"\n\n  **************************************"
 "\n  InfoSewer Steady-State Manhole Results"
-"\n  ************************************\n");
+"\n  **************************************\n");
     fprintf(f,
 "\n  -------------------------------------------------------------------"
 "\n                         Base Load    Total Load        HGL     Surch"
@@ -1764,54 +3160,74 @@ static void writeSteadyReport(void)
     FlowUnitWords[FlowUnits], FlowUnitWords[FlowUnits], UnitSystem == US ? "ft" : "m");
     for ( k = 0; k < N; k++ )
     {
-        if ( IsNode[k].isOutlet ) continue;
-        fprintf(f, "\n  %-16s %13.4f %13.4f %10.3f     %s", Node[k].ID,
+        if ( IsNode[k].kind != IS_NODE_LOAD ) continue;
+        fprintf(f, "\n  %-16s %13.4f %13.4f %10.3f     %s", NODE_ID(k),
             nodeBase(k) * ff, SStatic[k] * ff, SHead[k] * lf,
             SHead[k] >= IsNode[k].rim ? "YES" : "no");
+    }
+    for ( k = 0; k < N; k++ )
+    {
+        const char* what;
+        if ( IsNode[k].kind == IS_NODE_CHAMBER ) what = "chamber";
+        else if ( IsNode[k].kind == IS_NODE_WETWELL ) what = "wet well";
+        else continue;
+        fprintf(f, "\n  %-16s %13s %13s %10.3f     %s", NODE_ID(k), what, "",
+            SHead[k] * lf, "");
     }
     fprintf(f, "\n");
 }
 
 static void writeSteadyCsv(void)
 //  Every InfoSewer steady-state output array at full precision, in the
-//  engine's internal units (cfs, ft), for verification.
+//  engine's internal units (cfs, ft) and its output order, for verification.
 {
-    int i, k, L = Nobjects[LINK], N = Nobjects[NODE];
+    int i, k, N = IsNN;
     double *fr;
     TIsPipeOut o;
     FILE* f = fopen(IsResultsFile, "wt");
     if ( !f ) { report_writeErrorMsg(ERR_RPT_FILE, IsResultsFile); return; }
-    fr = (double*) calloc(L + 1, sizeof(double));
+    fr = (double*) calloc(IsNLE + 1, sizeof(double));
     fprintf(f, "kind,id,flow,unpeak,peak,cover,infil,storm,flowtype,full,rescap,vel,"
                "dD,qQ,depth,crit,froude,covcnt,backwater,adjdepth,adjvel,partial\n");
-    for ( i = 0; i < L; i++ )
+    for ( i = 0; i < IsNP; i++ )
     {
         pipeOutputs(i, &o);
         if ( fr ) fr[i] = o.froude;
         fprintf(f, "pipe,%s,%.17g,%.17g,%.17g,%.17g,%.17g,0,%.17g,%.17g,%.17g,%.17g,"
                    "%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
-            Link[i].ID, o.flow, o.unpeak, o.peak, o.cover, o.infil, o.flowtype,
+            LINK_ID(i), o.flow, o.unpeak, o.peak, o.cover, o.infil, o.flowtype,
             o.full, o.rescap, o.vel, o.dD, o.qQ, o.depth, o.crit, o.froude,
             o.covcnt, o.backwater, o.adjdepth, o.adjvel, o.partial);
     }
     fprintf(f, "kind,id,base,static,nstorm,head,surch,jump\n");
     for ( k = 0; k < N; k++ )
     {
-        if ( IsNode[k].isOutlet ) continue;
-        fprintf(f, "node,%s,%.17g,%.17g,0,%.17g,%.17g,%.17g\n", Node[k].ID,
+        if ( IsNode[k].kind != IS_NODE_LOAD ) continue;
+        fprintf(f, "node,%s,%.17g,%.17g,0,%.17g,%.17g,%.17g\n", NODE_ID(k),
             nodeBase(k), SStatic[k], SHead[k],
             SHead[k] >= IsNode[k].rim ? 1.0 : 0.0,
             fr ? (double)nodeJump(k, fr) : 0.0);
     }
+    fprintf(f, "kind,id,chead\n");
+    for ( k = 0; k < N; k++ )
+        if ( IsNode[k].kind == IS_NODE_CHAMBER )
+            fprintf(f, "chamber,%s,%.17g\n", NODE_ID(k), SHead[k]);
     fprintf(f, "kind,id,oflow,ohead\n");
     for ( k = 0; k < N; k++ )
-    {
-        double q = 0.0;
-        if ( !IsNode[k].isOutlet ) continue;
-        // Fv_GetOutletFlow: sums the UNclipped link flows
-        for ( i = 0; i < L; i++ ) if ( IsPipe[i].to == k ) q += SQ[i];
-        fprintf(f, "outlet,%s,%.17g,%.17g\n", Node[k].ID, q, SHead[k]);
-    }
+        if ( IsNode[k].kind == IS_NODE_OUTLET )
+            fprintf(f, "outlet,%s,%.17g,%.17g\n", NODE_ID(k), outletFlow(k), SHead[k]);
+    fprintf(f, "kind,id,whead\n");
+    for ( k = 0; k < N; k++ )
+        if ( IsNode[k].kind == IS_NODE_WETWELL )
+            fprintf(f, "wetwell,%s,%.17g\n", NODE_ID(k), SHead[k]);
+    fprintf(f, "kind,id,fflow,funpeak,fpeak,fcover,finfil,fstorm,fvel,floss\n");
+    for ( i = IsNP; i < IsNPM; i++ )
+        fprintf(f, "fm,%s,%.17g,%.17g,%.17g,%.17g,%.17g,0,%.17g,%.17g\n", LINK_ID(i),
+            SQ[i], SUP[i] - SINF[i], SPK[i], SCV[i], SINF[i], SVel[i], SFmLoss[i - IsNP]);
+    fprintf(f, "kind,id,pflow,phead,ppower,pusage,pspeed\n");
+    for ( i = 0; i < IsNPump; i++ )
+        fprintf(f, "pump,%s,%.17g,%.17g,%.17g,%.17g,%.17g\n", Link[IsPump[i].swmm].ID,
+            pumpOut(i, 0), pumpOut(i, 1), pumpOut(i, 2), pumpOut(i, 3), pumpOut(i, 4));
     FREE(fr);
     fclose(f);
 }
@@ -1824,12 +3240,23 @@ static void freeAll(void)
     FREE(SQ); FREE(SUP); FREE(SPK); FREE(SCV); FREE(SCC); FREE(SINF);
     FREE(SDepth); FREE(SVel); FREE(SCrit); FREE(SFull); FREE(SFtype);
     FREE(SPartial); FREE(SAdjFull); FREE(SStatic); FREE(SHead); FREE(SInc);
+    FREE(SFmLoss); FREE(SPumpHead); FREE(SWellHead);
+    FREE(SPumpHead0); FREE(SPumpA); FREE(SPumpB); FREE(SPumpPB); FREE(SPumpOn);
+    FREE(SPumpSpeed);
+    if ( IsStation ) for ( p = 0; p < IsNStation; p++ ) FREE(IsStation[p].pump);
+    if ( IsSiphon )  for ( p = 0; p < IsNSiphon; p++ )  FREE(IsSiphon[p].fm);
+    FREE(IsStation); FREE(IsSiphon); FREE(IsPump); FREE(IsWell);
     FREE(IsNode); FREE(IsPipe); FREE(IsOrder); FREE(IsAllocList); FREE(IsRim);
+    FREE(IsFullDepth0); FREE(IsLinkInv); FREE(IsNodeOfSwmm); FREE(IsLinkOfSwmm);
     for ( p = 0; p < IsNpats; p++ ) FREE(IsPats[p].f);
     for ( p = 0; p < IsNcurves; p++ ) { FREE(IsCurves[p].x); FREE(IsCurves[p].y); }
     FREE(IsPats); FREE(IsCurves); FREE(IsLoads); FREE(SplitIn); FREE(InfilIn);
+    FREE(ChamberIn); FREE(WellIn); FREE(PumpIn);
     IsNpats = MaxPats = IsNcurves = MaxCurves = IsNloads = MaxLoads = 0;
     NsplitIn = MaxSplitIn = NinfilIn = MaxInfilIn = 0;
+    NchamberIn = MaxChamberIn = NwellIn = MaxWellIn = NpumpIn = MaxPumpIn = 0;
+    IsNN = IsNP = IsNF = IsNPM = IsNPump = IsNWell = IsNStation = IsNSiphon = 0;
+    IsNT = IsNLE = 0;
 }
 
 void isewer_close(void)

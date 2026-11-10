@@ -8,12 +8,16 @@ stock EPA SWMM 5.2.4.
                         [--results results.csv]
 
 Without --stock the file is for swmm5-infosewer: FLOW_ROUTING INFOSEWER, the
-InfoSewer options, and the InfoSewer-only data in five extra sections:
+InfoSewer options, and the InfoSewer-only data in extra sections:
   [INFOSEWER_LOADS]         Node Base Type(UNPEAK|PEAK|COVER) Pattern|* CoverUnits
   [INFOSEWER_PATTERNS]      Name STEPWISE|LINEAR f1 f2 ...
-  [INFOSEWER_CURVES]        Name X Y   (peaking curves)
+  [INFOSEWER_CURVES]        Name X Y   (peaking curves, wet well level-volume curves)
   [INFOSEWER_SPLITS]        Link Percent
   [INFOSEWER_INFILTRATION]  Link LENGTH|DIAMETER|SURFACE|COUNT|PATTERN Rate [Count|Pattern]
+  [INFOSEWER_CHAMBERS]      Node Diameter
+  [INFOSEWER_WETWELLS]      Node MinLevel VolumeCurve|* [Diameter]
+  [INFOSEWER_PUMPS]         Link CAPACITY|POINT|THREEPOINT Extra Capacity Head0 Head1 Flow1
+                            Head2 Flow2 Speed Pattern|* StaticFlow BaseFlow
 With --stock the same network gets its loads as plain [DWF] and [INFLOWS] so stock
 EPA SWMM 5.2.4 can run it (no peaking: steady-state peaking has no stock SWMM5
 equivalent).
@@ -26,17 +30,25 @@ Network mapping (InfoSewer pipe diameters are inches, or mm with LPS/MLD):
   outlet          -> [OUTFALLS] FREE, or FIXED at the [Outlet Heads] head
   gravity pipe    -> [CONDUITS] + [XSECTIONS] CIRCULAR, barrels = count + 1,
                      LINK_OFFSETS ELEVATION with the InfoSewer inverts
+  junction chamber -> [JUNCTIONS] (+ [INFOSEWER_CHAMBERS]); its K into [LOSSES]
+  wet well        -> [STORAGE] invert = bottom, max depth = max level, initial
+                     depth = initial level, CYLINDRICAL or TABULAR WWA_<id> area curve
+  force main      -> [CONDUITS] + [XSECTIONS] FORCE_MAIN D C, FORCE_MAIN_EQUATION H-W
+  pump            -> [PUMPS] + PC_<id> curve (PUMP3, or PUMP4 for capacity pumps)
+Refused: [Channel Shape], [Controls] and [Status] data, storm runoff analysis,
+"Advanced Forcemain Network Support : YES" and force mains with C <= 10.
 Numbers are written with Python's shortest round-trip repr, so SWMM reads back
 exactly the doubles InfoSewer uses.
 With --iedb, NODE.DBF X/Y and VERTEX.DBF give [COORDINATES] and [VERTICES].
 
-Written by Claude (AI) for SWMM Enablement, 2026-11-09.
+Written by Claude (AI) for SWMM Enablement, 2026-11-09; pressure networks 2026-11-10.
 """
 import sys, os, argparse, collections
 
 SWMM_FLOW_UNITS = {"CFS": "CFS", "GPM": "GPM", "MGD": "MGD", "LPS": "LPS", "MLD": "MLD"}
 LOAD_TYPES = {0: "UNPEAK", 1: "PEAK", 2: "COVER"}
 INFIL_TYPES = {1: "LENGTH", 2: "DIAMETER", 3: "SURFACE", 4: "COUNT", 5: "PATTERN"}
+PUMP_TYPES = {0: "CAPACITY", 1: "POINT", 2: "THREEPOINT"}
 ZERO_TOL = 0.0001            # HMAP_ZeroTolerance: manhole loads below this are dropped
 
 
@@ -80,9 +92,21 @@ class Model:
         self.title = " ".join(l.strip() for l in S.get("Titles", []))
         self.opt = kv(S.get("Options", []))
         self.time = kv(S.get("Time", []))
-        for unsupported in ("Junction Chambers", "Wet Wells", "Force Mains", "Pumps", "Channel Shape"):
+        # [Report] Link : Yes|No (he_input.cpp:9500); the engine's EPS report
+        # re-reads the pipe results when it is on, which doubles a mass balance term
+        self.link_report = True
+        for l in S.get("Report", []):
+            t = l.replace(":", " ").split()
+            if not t:
+                break
+            if t[0].lower() == "link" and t[-1].lower() in ("yes", "no"):
+                self.link_report = t[-1].lower() == "yes"
+        for unsupported in ("Channel Shape", "Controls", "Status"):
             if any(toks(l) for l in S.get(unsupported, [])):
-                sys.exit("model has [%s] data: this version handles gravity-only networks" % unsupported)
+                sys.exit("model has [%s] data: not supported yet" % unsupported)
+        adv = [v for k, v in self.opt.items() if k.lower().startswith("advanced")]
+        if adv and adv[0].strip().upper().startswith("YES"):
+            sys.exit("Advanced Forcemain Network Support is on: only simple siphons are supported yet")
         if self.opt.get("Storm Runoff Analysis", "0").strip() not in ("0", "0.0", ""):
             sys.exit("Storm Runoff Analysis is on: storm loads are not supported yet")
 
@@ -132,6 +156,35 @@ class Model:
             t = toks(l)
             if len(t) >= 2 and t[0] in self.outlets:
                 self.outlet_heads[t[0]] = float(t[1])
+
+        self.chambers = collections.OrderedDict()      # id -> rim, diam, loss
+        for l in S.get("Junction Chambers", []):
+            t = toks(l)
+            if len(t) >= 4:
+                self.chambers[t[0]] = dict(rim=float(t[1]), diam=float(t[2]), loss=float(t[3]))
+        self.wetwells = collections.OrderedDict()      # 9 tokens exactly (he_input.cpp:4639)
+        for l in S.get("Wet Wells", []):
+            t = toks(l)
+            if len(t) != 9:
+                continue
+            self.wetwells[t[0]] = dict(type=int(float(t[1])), bottom=float(t[2]), minl=float(t[3]),
+                                       maxl=float(t[4]), initl=float(t[5]), diam=t[6], curve=t[7],
+                                       loss=float(t[8]))
+        self.forcemains = collections.OrderedDict()
+        for l in S.get("Force Mains", []):
+            t = toks(l)
+            if len(t) < 8:
+                continue
+            self.forcemains[t[0]] = dict(n1=t[1], n2=t[2], z1=float(t[3]), z2=float(t[4]),
+                                         length=float(t[5]), diam_in=float(t[6]), c=float(t[7]))
+            if float(t[7]) <= 10.0:
+                sys.exit("force main %s: friction %s is not a Hazen-Williams C (> 10)" % (t[0], t[7]))
+        self.pumps = collections.OrderedDict()         # 15 tokens exactly (he_input.cpp:6718)
+        for l in S.get("Pumps", []):
+            t = toks(l)
+            if len(t) != 15:
+                continue
+            self.pumps[t[0]] = dict(n1=t[1], n2=t[2], tok=t[3:15])
 
         self.pipes = collections.OrderedDict()
         for l in S.get("Pipes", []):
@@ -191,13 +244,15 @@ class Model:
             elif cid is not None and len(t) >= 2:
                 self.curves[cid][1].append((float(t[0]), float(t[1])))
 
-        # node inverts: lowest connected pipe invert
+        # node inverts: lowest connected pipe or force main invert
         inv = {}
-        for p in self.pipes.values():
+        for p in list(self.pipes.values()) + list(self.forcemains.values()):
             inv[p["n1"]] = min(inv.get(p["n1"], 1e30), p["z1"])
             inv[p["n2"]] = min(inv.get(p["n2"], 1e30), p["z2"])
+        for w in self.wetwells:
+            inv[w] = self.wetwells[w]["bottom"]
         self.invert = inv
-        for nid in list(self.manholes) + list(self.outlets):
+        for nid in list(self.manholes) + list(self.outlets) + list(self.chambers):
             if nid not in inv:
                 sys.exit("node %s has no connected pipe" % nid)
 
@@ -259,6 +314,8 @@ def write_inp(m, out, mode, stock, iedb, results):
     w("REPORT_STEP          %s" % hhmm(rstep))
     w("ROUTING_STEP         60")
     w("ALLOW_PONDING        NO")
+    if m.forcemains:
+        w("FORCE_MAIN_EQUATION  H-W")
     if stock == "DYNWAVE":
         w("VARIABLE_STEP        0.75\nMIN_SURFAREA         12.566\nHEAD_TOLERANCE       0.005")
     if not stock:
@@ -276,6 +333,8 @@ def write_inp(m, out, mode, stock, iedb, results):
                           ("Flow Tolerance", "INFOSEWER_FLOW_TOLERANCE")):
             if a(key):
                 w("%-20s %s" % (name, a(key)))
+        if a("Pump Flow Continuity"):
+            w("INFOSEWER_PUMP_CONTINUITY %s" % a("Pump Flow Continuity"))
         pk = m.curve_option("Peaking Factor Curve ID")
         cv = m.curve_option("Coverage Based Peaking Curve")
         if pk:
@@ -283,6 +342,10 @@ def write_inp(m, out, mode, stock, iedb, results):
         if cv:
             w("INFOSEWER_COVER_CURVE %s" % cv)
         w("INFOSEWER_PATTERN_STEP %s" % hhmm(pstep))
+        if m.pumps:
+            w("INFOSEWER_PUMP_STEP  %s" % hhmm(m.hours("Simulation Time Step for Pump", 1.0 / 60.0)))
+        if not m.link_report:
+            w("INFOSEWER_LINK_REPORT NO")
         if results:
             w("INFOSEWER_RESULTS_FILE \"%s\"" % results)
     w("")
@@ -292,6 +355,9 @@ def write_inp(m, out, mode, stock, iedb, results):
         z = m.invert[nid]
         w("%-16s %-18s %-18s 0          %-10s 0" % (nid, num(z), num(max(mh["rim"] - z, 0.0)),
                                                     "1000" if mh["head"] == 1 else "0"))
+    for nid, ch in m.chambers.items():
+        z = m.invert[nid]
+        w("%-16s %-18s %-18s 0          0          0" % (nid, num(z), num(max(ch["rim"] - z, 0.0))))
     w("")
     w("[OUTFALLS]\n;;Name           Elevation          Type       Stage              Gated")
     for nid in m.outlets:
@@ -300,18 +366,43 @@ def write_inp(m, out, mode, stock, iedb, results):
         else:
             w("%-16s %-18s FREE                          NO" % (nid, num(m.invert[nid])))
     w("")
+    if m.wetwells:
+        w("[STORAGE]\n;;Name           Elev               MaxDepth           InitDepth          Shape       Params...")
+        for nid, ww in m.wetwells.items():
+            if ww["type"] == 0:
+                d = num(float(ww["diam"]))
+                w("%-16s %-18s %-18s %-18s CYLINDRICAL %s %s 0 0 0" % (nid, num(ww["bottom"]), num(ww["maxl"]),
+                                                                      num(ww["initl"]), d, d))
+            else:
+                w("%-16s %-18s %-18s %-18s TABULAR     WWA_%s 0 0" % (nid, num(ww["bottom"]), num(ww["maxl"]),
+                                                                     num(ww["initl"]), nid))
+        w("")
     w("[CONDUITS]\n;;Name           From             To               Length     Roughness  InOffset           OutOffset          InitFlow   MaxFlow")
     for pid, p in m.pipes.items():
         w("%-16s %-16s %-16s %-10s %-10s %-18s %-18s 0          0" % (
             pid, p["n1"], p["n2"], num(p["length"]), num(p["n"]), num(p["z1"]), num(p["z2"])))
+    for fid, f in m.forcemains.items():
+        w("%-16s %-16s %-16s %-10s 0.011      %-18s %-18s 0          0" % (
+            fid, f["n1"], f["n2"], num(f["length"]), num(f["z1"]), num(f["z2"])))
     w("")
+    if m.pumps:
+        w("[PUMPS]\n;;Name           From             To               Curve            Status   Startup    Shutoff")
+        for pid, p in m.pumps.items():
+            ww = m.wetwells.get(p["n1"])
+            w("%-16s %-16s %-16s %-16s ON       %-10s %s" % (pid, p["n1"], p["n2"], "PC_" + pid,
+                                                        num(ww["maxl"]) if ww else "0", num(ww["minl"]) if ww else "0"))
+        w("")
     w("[XSECTIONS]\n;;Link           Shape        Geom1                Geom2  Geom3  Geom4  Barrels")
     for pid, p in m.pipes.items():
         geom1 = p["diam_in"] / 12.0 if us else p["diam_in"] / 1000.0     # in -> ft, mm -> m
         w("%-16s CIRCULAR     %-20s 0      0      0      %d" % (pid, num(geom1), p["extra"] + 1))
+    for fid, f in m.forcemains.items():
+        geom1 = f["diam_in"] / 12.0 if us else f["diam_in"] / 1000.0
+        w("%-16s FORCE_MAIN   %-20s %-6s 0      0      1" % (fid, num(geom1), num(f["c"])))
     w("")
-    losses = [(pid, m.manholes[p["n1"]]["loss"]) for pid, p in m.pipes.items()
-              if p["n1"] in m.manholes and m.manholes[p["n1"]]["loss"] != 0.0]
+    kloss = {k: v["loss"] for k, v in list(m.manholes.items()) + list(m.chambers.items())}
+    losses = [(pid, kloss[p["n1"]]) for pid, p in list(m.pipes.items()) + list(m.forcemains.items())
+              if kloss.get(p["n1"], 0.0) != 0.0]
     if losses:
         w("[LOSSES]\n;;Link           Kentry     Kexit      Kavg       FlapGate   Seepage")
         for pid, k in losses:
@@ -327,6 +418,7 @@ def write_inp(m, out, mode, stock, iedb, results):
         w("")
         used = {pat for mh in m.manholes.values() for _, _, pat, _ in mh["loads"] if pat}
         used |= {v[3] for v in m.infil.values() if v[3]}
+        used |= {p["tok"][9] for p in m.pumps.values() if p["tok"][9] != "-"}
         if used:
             w("[INFOSEWER_PATTERNS]\n;;Name           Type      Factors...")
             for pid, (ptype, vals) in m.patterns.items():
@@ -337,6 +429,7 @@ def write_inp(m, out, mode, stock, iedb, results):
             w("")
         cids = [c for c in (m.curve_option("Peaking Factor Curve ID"),
                             m.curve_option("Coverage Based Peaking Curve")) if c]
+        cids += [ww["curve"] for ww in m.wetwells.values() if ww["type"] == 1 and ww["curve"] in m.curves]
         if cids:
             w("[INFOSEWER_CURVES]\n;;Name           X                  Y")
             for cid in dict.fromkeys(cids):
@@ -353,6 +446,28 @@ def write_inp(m, out, mode, stock, iedb, results):
             for pid, (it, rate, count, pat) in m.infil.items():
                 extra = num(count) if it == 4 else (pat or "") if it == 5 else ""
                 w("%-16s %-9s %-18s %s" % (pid, INFIL_TYPES[it], num(rate), extra))
+            w("")
+        if m.chambers:
+            w("[INFOSEWER_CHAMBERS]\n;;Node           Diameter")
+            for nid, ch in m.chambers.items():
+                w("%-16s %s" % (nid, num(ch["diam"])))
+            w("")
+        if m.wetwells:
+            w("[INFOSEWER_WETWELLS]\n;;Node           MinLevel           VolumeCurve      Diameter")
+            for nid, ww in m.wetwells.items():
+                if ww["type"] == 1:
+                    w("%-16s %-18s %s" % (nid, num(ww["minl"]), ww["curve"]))
+                else:
+                    w("%-16s %-18s %-16s %s" % (nid, num(ww["minl"]), "*", num(float(ww["diam"]))))
+            w("")
+        if m.pumps:
+            w("[INFOSEWER_PUMPS]\n;;Link           Type        Extra Capacity Head0 Head1 Flow1 Head2 Flow2 Speed Pattern StaticFlow BaseFlow")
+            for pid, p in m.pumps.items():
+                t = p["tok"]
+                kind = PUMP_TYPES.get(int(float(t[0])))
+                if kind is None:
+                    sys.exit("pump %s: type %s not supported" % (pid, t[0]))
+                w("%-16s %-11s %s %s" % (pid, kind, t[1], " ".join(t[2:12])))
             w("")
     else:
         # stock SWMM5: constant loads as DWF baselines; patterned loads as a step
@@ -385,6 +500,34 @@ def write_inp(m, out, mode, stock, iedb, results):
                         w("TS_%-13s %-10s %s" % (nid, hhmm(t0 + pstep - 1.0 / 3600.0), num(q)))
             w("")
 
+    if m.pumps or any(ww["type"] == 1 for ww in m.wetwells.values()):
+        w("[CURVES]\n;;Name           Type       X                  Y")
+        for pid, p in m.pumps.items():
+            t = [x for x in p["tok"]]
+            kind, n = int(float(t[0])), int(float(t[1])) + 1
+            ww = m.wetwells.get(p["n1"])
+            if kind == 0:
+                cap = float(t[2]) * n
+                w("%-16s PUMP4      0                  %s" % ("PC_" + pid, num(cap)))
+                w("%-16s            %-18s %s" % ("PC_" + pid, num(max(ww["maxl"] if ww else 100.0, 1.0) * 10), num(cap)))
+            else:
+                h1, q1 = float(t[4]), float(t[5])
+                if kind == 1:
+                    h0, h2, q2 = 1.33334 * h1, 0.0, 2.0 * q1
+                else:
+                    h0, h2, q2 = float(t[3]), float(t[6]), float(t[7])
+                pts = [(h2, q2 * n), (h1, q1 * n), (h0, 0.0)]
+                for i, (h, q) in enumerate(pts):
+                    w("%-16s %-10s %-18s %s" % ("PC_" + pid, "PUMP3" if i == 0 else "", num(h), num(q)))
+        for nid, ww in m.wetwells.items():
+            if ww["type"] != 1 or ww["curve"] not in m.curves:
+                continue
+            pts = m.curves[ww["curve"]][1]
+            for i, (h, v) in enumerate(pts):
+                if i + 1 < len(pts):
+                    a = (pts[i + 1][1] - v) / (pts[i + 1][0] - h)
+                w("%-16s %-10s %-18s %s" % ("WWA_" + nid, "STORAGE" if i == 0 else "", num(h), num(max(a, 0.0))))
+        w("")
     w("[REPORT]\nINPUT      NO\nCONTROLS   NO\nSUBCATCHMENTS NONE\nNODES ALL\nLINKS ALL\n")
     if iedb:
         try:
@@ -418,7 +561,12 @@ def main():
     a = ap.parse_args()
     m = Model(a.ise_txt)
     write_inp(m, a.out_inp, a.mode, a.stock, a.iedb, a.results)
-    print("%d junctions, %d outfalls, %d conduits -> %s" % (len(m.manholes), len(m.outlets), len(m.pipes), a.out_inp))
+    extra = ""
+    if m.chambers or m.wetwells or m.forcemains or m.pumps:
+        extra = " (+ %d chambers, %d wet wells, %d force mains, %d pumps)" % (
+            len(m.chambers), len(m.wetwells), len(m.forcemains), len(m.pumps))
+    print("%d manholes, %d outfalls, %d pipes%s -> %s" % (len(m.manholes), len(m.outlets), len(m.pipes),
+                                                         extra, a.out_inp))
 
 
 if __name__ == "__main__":

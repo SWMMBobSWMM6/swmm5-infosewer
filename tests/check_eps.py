@@ -18,10 +18,17 @@ ROOT = os.path.dirname(HERE)
 PIPE_ARRAYS = ["flow", "vel", "depth", "froude", "dD", "overflow", "backwater",
                "adjdepth", "adjvel", "qQ", "flowtype", "partial"]
 NODE_ARRAYS = ["load", "head", "status", "jump"]
+WELL_ARRAYS = ["wlevel", "whead", "wvolume", "wpercent", "woverflow"]
+FM_ARRAYS = ["fflow", "fvel", "floss"]
+PUMP_ARRAYS = ["pflow", "phead", "ppower", "pusage", "pspeed"]
+# csv kind -> (arrays, key in the parse_out step dict)
+EXTRA = [("chamber", ["chead"]), ("wetwell", WELL_ARRAYS), ("fm", FM_ARRAYS), ("pump", PUMP_ARRAYS)]
 
 
-def parse_out(path, P, N, O, start_h, nrep):
-    """engine EPS .out (layout from spec/eps_ref.py:parse_out)"""
+def parse_out(path, P, N, O, start_h, nrep, C=0, W=0, F=0, PU=0):
+    """engine EPS .out (Fv_DynamicData he_dynamicrun.cpp:11228): per report time
+    6 loading manhole arrays, chamber head, 2 outlet arrays, 5 wet well arrays,
+    10 pipe arrays, 3 force main arrays, 5 pump arrays, 2 HGL pipe flags"""
     b = open(path, "rb").read()
     for off in range(0, len(b) - 12, 4):
         n = struct.unpack_from("<i", b, off)[0]
@@ -39,12 +46,18 @@ def parse_out(path, P, N, O, start_h, nrep):
     steps = []
     for k in range(n):
         d = {}
-        for name in ["load", "storm", "totstorm", "head", "status", "jump"]:
-            d[name] = struct.unpack_from("<%dd" % N, b, p); p += 8 * N
-        d["outflow"] = struct.unpack_from("<%dd" % O, b, p); p += 8 * O
-        d["outhead"] = struct.unpack_from("<%dd" % O, b, p); p += 8 * O
-        for name in PIPE_ARRAYS:
-            d[name] = struct.unpack_from("<%dd" % P, b, p); p += 8 * P
+        def take(names, cnt):
+            nonlocal p
+            for name in names:
+                d[name] = struct.unpack_from("<%dd" % cnt, b, p); p += 8 * cnt
+        take(["load", "storm", "totstorm", "head", "status", "jump"], N)
+        take(["chead"], C)
+        take(["outflow", "outhead"], O)
+        take(WELL_ARRAYS, W)
+        take(PIPE_ARRAYS[:10], P)
+        take(FM_ARRAYS, F)
+        take(PUMP_ARRAYS, PU)
+        take(PIPE_ARRAYS[10:], P)
         steps.append(d)
     return steps
 
@@ -55,11 +68,15 @@ def parse_massbal(rpt):
         m = re.search(re.escape(label) + r"[^\d\-]*([\-\d\.]+)", txt)
         return float(m.group(1)) if m else None
     return dict(inflow=g("Total external inflow:"), outflow=g("Total extern outflow:"),
-                storage=g("Final Gravity Main Storage:"), check=g("Mass Balance Check:"))
+                storage=g("Final Gravity Main Storage:"), check=g("Mass Balance Check:"),
+                initwell=g("Initial Wet Well Storage:") or 0.0,
+                finalwell=g("Final Wet Well Storage:") or 0.0,
+                wellflood=g("Wet Well Flooding Volume:") or 0.0)
 
 
 def read_csv(path):
-    rows = {"pipe": [], "node": [], "outlet": [], "max": [], "massbal": []}
+    rows = {"pipe": [], "node": [], "outlet": [], "max": [], "massbal": [],
+            "chamber": [], "wetwell": [], "fm": [], "pump": []}
     hdr = None
     for row in csv.reader(open(path)):
         if row[0] == "kind":
@@ -82,7 +99,7 @@ def start_hours(txt):
     return 0.0
 
 
-def check(txt, ref, exe, work, verbose):
+def check(txt, ref, exe, work, verbose, erpt=None):
     base = os.path.splitext(os.path.basename(txt))[0]
     inp, rpt, out, res = (os.path.join(work, base + e) for e in (".inp", ".rpt", ".out", ".csv"))
     if os.path.exists(res):
@@ -98,7 +115,9 @@ def check(txt, ref, exe, work, verbose):
     nid = [n["id"] for n in R["node"] if n["report"] == "0"]
     oid = [o["id"] for o in R["outlet"] if o["report"] == "0"]
     nrep = len(R["pipe"]) // max(1, len(pid))
-    E = parse_out(ref, len(pid), len(nid), len(oid), start_hours(txt), nrep)
+    xid = {kind: [x["id"] for x in R[kind] if x["report"] == "0"] for kind, _ in EXTRA}
+    E = parse_out(ref, len(pid), len(nid), len(oid), start_hours(txt), nrep,
+                  len(xid["chamber"]), len(xid["wetwell"]), len(xid["fm"]), len(xid["pump"]))
     worst, wkey, nbad, nval = 0.0, "", 0, 0
     def cmp(key, ident, rep, x, y):
         nonlocal worst, wkey, nbad, nval
@@ -126,19 +145,61 @@ def check(txt, ref, exe, work, verbose):
         for i, o in enumerate(Oo):
             cmp("outflow", o["id"], rep, float(o["outflow"]), E[rep]["outflow"][i])
             cmp("outhead", o["id"], rep, float(o["outhead"]), E[rep]["outhead"][i])
-    erpt = os.path.splitext(ref)[0] + ".rpt"
+        for kind, arrs in EXTRA:
+            n = len(xid[kind])
+            X = R[kind][rep * n:(rep + 1) * n]
+            for key in arrs:
+                for i, x in enumerate(X):
+                    cmp(key, x["id"], rep, float(x[key]), E[rep][key][i])
     mb = ""
-    if os.path.exists(erpt):
+    if erpt and os.path.exists(erpt):
         em = parse_massbal(erpt)
         mm = R["massbal"][0]
         mi, mo, ms = float(mm["in"]), float(mm["out"]), float(mm["storage"])
-        ck = abs(100.0 * (mi - (mo + ms)) / mi) if mi else 0.0
+        wi, wf, wo = (float(mm.get(k) or 0.0) for k in ("initwell", "finalwell", "wellflood"))
+        tot = mi + wi
+        ck = abs(100.0 * (tot - (mo + wf + ms + wo)) / tot) if tot else 0.0
         mb = "  massbal in %.3f/%.3f out %.3f/%.3f stor %.3f/%.3f check %.3f/%.3f" % (
             mi, em["inflow"], mo, em["outflow"], ms, em["storage"], ck, em["check"])
-    print("%-14s %7d values %6d differ  max rel diff %.3e  %s" % (base, nval, nbad, worst, wkey))
+        if wi or wf or em["initwell"] or em["finalwell"]:
+            mb += "  wells %.3f/%.3f -> %.3f/%.3f flood %.3f/%.3f" % (
+                wi, em["initwell"], wf, em["finalwell"], wo, em["wellflood"])
+        # the engine prints %.3f: a term off by more than its rounding fails
+        pairs = [(mi, em["inflow"]), (mo, em["outflow"]), (ms, em["storage"]), (ck, em["check"]),
+                 (wi, em["initwell"]), (wf, em["finalwell"]), (wo, em["wellflood"])]
+        if any(e is not None and abs(x - e) > 0.0015 for x, e in pairs):
+            mb += "  MASS BALANCE DIFFERS"
+            worst = max(worst, 1.0)
+    si = any(l.split(":", 1)[1].strip().upper() in ("LPS", "MLD")
+             for l in open(txt, encoding="latin-1") if l.lower().startswith("flow unit"))
+    print("%-14s %7d values %6d differ  max rel diff %.3e  %s%s" % (
+        base, nval, nbad, worst, wkey,
+        "  (SI units: diameters in mm/1000 m, tolerance 1e-10)" if si else ""))
     if mb:
         print(mb)
-    return worst
+    return 0.0 if (si and worst < 1e-10) else worst
+
+
+def unxz(path, work):
+    """reference files may be stored xz-compressed (X.txt.xz, X.out.xz): give a
+    plain copy in the work folder"""
+    if not path.endswith(".xz"):
+        return path
+    import lzma
+    os.makedirs(os.path.join(work, "ref"), exist_ok=True)
+    plain = os.path.join(work, "ref", os.path.basename(path)[:-3])
+    if not os.path.exists(plain) or os.path.getmtime(plain) < os.path.getmtime(path):
+        with lzma.open(path) as f, open(plain, "wb") as g:
+            g.write(f.read())
+    return plain
+
+
+def find_ref(d, b, ext=".out"):
+    for name in (b + ext, "ref_" + b + ext, "ref_" + b.split("_")[-1] + ext):
+        for p in (os.path.join(d, name), os.path.join(d, name + ".xz")):
+            if os.path.exists(p):
+                return p
+    return None
 
 
 def main(argv):
@@ -151,18 +212,20 @@ def main(argv):
         del args[i:i + 2]
     txts = []
     for a in args:
-        txts += sorted(glob.glob(os.path.join(a, "*.txt"))) if os.path.isdir(a) else [a]
+        txts += sorted(glob.glob(os.path.join(a, "*.txt")) + glob.glob(os.path.join(a, "*.txt.xz"))) \
+            if os.path.isdir(a) else [a]
     work = os.path.join(HERE, "work_eps")
     os.makedirs(work, exist_ok=True)
     worst, n = 0.0, 0
     for t in txts:
         d, b = os.path.split(t)
-        b = os.path.splitext(b)[0]
-        ref = next((p for p in (os.path.join(d, b + ".out"), os.path.join(d, "ref_" + b + ".out"),
-                                os.path.join(d, "ref_" + b.split("_")[-1] + ".out")) if os.path.exists(p)), None)
+        b = b[:-7] if b.endswith(".txt.xz") else os.path.splitext(b)[0]
+        t = unxz(t, work)
+        ref = find_ref(d, b)
         if not ref:
             continue
-        w = check(t, ref, exe, work, verbose)
+        rpt = find_ref(d, b, ".rpt")
+        w = check(t, unxz(ref, work), exe, work, verbose, rpt and unxz(rpt, work))
         worst = float("inf") if w is None else max(worst, w)
         n += 1
     print("%d models, overall max relative difference %.3e" % (n, worst))

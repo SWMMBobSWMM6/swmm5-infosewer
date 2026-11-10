@@ -464,5 +464,8 @@
 #define  ws_ISW_CURVES       "[INFOSEWER_CURVES"     // swmm5-infosewer
 #define  ws_ISW_SPLITS       "[INFOSEWER_SPLITS"     // swmm5-infosewer
 #define  ws_ISW_INFIL        "[INFOSEWER_INFILTRATION" // swmm5-infosewer
+#define  ws_ISW_CHAMBERS     "[INFOSEWER_CHAMBERS"   // swmm5-infosewer
+#define  ws_ISW_WETWELLS     "[INFOSEWER_WETWELLS"   // swmm5-infosewer
+#define  ws_ISW_PUMPS        "[INFOSEWER_PUMPS"      // swmm5-infosewer
 
 #endif //TEXT_H

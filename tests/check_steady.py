@@ -6,8 +6,10 @@ and compare every steady-state output array with the InfoSewer engine's own .out
 
 For each X.txt with an engine result X.out beside it (or ref_X.out), the script
 converts X.txt with tools/ise2inp.py, runs bin/swmm5_is with
-INFOSEWER_RESULTS_FILE, and compares the 28 arrays (20 pipe, 6 manhole,
-2 outlet) value by value. Prints the largest relative difference per model.
+INFOSEWER_RESULTS_FILE, and compares every steady array value by value: 20 per
+gravity pipe, 6 per loading manhole, 1 per junction chamber, 2 per outlet, 1 per
+wet well, 8 per force main and 5 per pump. Prints the largest relative
+difference per model.
 
 Written by Claude (AI) for SWMM Enablement, 2026-11-09.
 """
@@ -19,22 +21,31 @@ PIPE_ARRAYS = ["flow", "unpeak", "peak", "cover", "infil", "storm", "flowtype", 
                "rescap", "vel", "dD", "qQ", "depth", "crit", "froude", "covcnt",
                "backwater", "adjdepth", "adjvel", "partial"]
 NODE_ARRAYS = ["base", "static", "nstorm", "head", "surch", "jump"]
+FM_ARRAYS = ["fflow", "funpeak", "fpeak", "fcover", "finfil", "fstorm", "fvel", "floss"]
+PUMP_ARRAYS = ["pflow", "phead", "ppower", "pusage", "pspeed"]
+# (csv kind, arrays) in the engine's output order after the pipes
+GROUPS = [("node", NODE_ARRAYS), ("chamber", ["chead"]), ("outlet", ["oflow", "ohead"]),
+          ("wetwell", ["whead"]), ("fm", FM_ARRAYS), ("pump", PUMP_ARRAYS)]
 
 
-def read_out(path, P, N, O):
-    # static .out layout: header, 20 pipe arrays, 6 loading-manhole arrays, 2 outlet arrays
+def read_out(path, counts):
+    # static .out layout (Fv_StaticOut he_staticrun.cpp:987): header, 20 gravity pipe
+    # arrays, then each group of GROUPS; an empty group writes nothing
     b = open(path, "rb").read()
-    H = len(b) - 8 * (20 * P + 6 * N + 2 * O)
-    arr = lambda off, cnt: list(struct.unpack("<%dd" % cnt, b[off:off + 8 * cnt]))
-    R = {k: arr(H + i * P * 8, P) for i, k in enumerate(PIPE_ARRAYS)}
-    R.update({k: arr(H + 20 * P * 8 + i * N * 8, N) for i, k in enumerate(NODE_ARRAYS)})
-    o = arr(H + 20 * P * 8 + 6 * N * 8, 2 * O)
-    R["oflow"], R["ohead"] = o[:O], o[O:]
+    groups = [("pipe", PIPE_ARRAYS)] + GROUPS
+    total = sum(len(arrs) * counts[kind] for kind, arrs in groups)
+    off = len(b) - 8 * total
+    R = {}
+    for kind, arrs in groups:
+        n = counts[kind]
+        for k in arrs:
+            R[k] = list(struct.unpack("<%dd" % n, b[off:off + 8 * n]))
+            off += 8 * n
     return R
 
 
 def read_csv(path):
-    pipes, nodes, outs = [], [], []
+    rows = {kind: [] for kind in ["pipe"] + [g[0] for g in GROUPS]}
     hdr = None
     for row in csv.reader(open(path)):
         if row[0] == "kind":
@@ -42,13 +53,15 @@ def read_csv(path):
             continue
         d = dict(zip(hdr[2:], (float(x) for x in row[2:])))
         d["id"] = row[1]
-        {"pipe": pipes, "node": nodes, "outlet": outs}[row[0]].append(d)
-    R = {k: [p[k] for p in pipes] for k in PIPE_ARRAYS}
-    R.update({k: [n[k] for n in nodes] for k in NODE_ARRAYS})
-    R["oflow"] = [o["oflow"] for o in outs]
-    R["ohead"] = [o["ohead"] for o in outs]
-    ids = ([p["id"] for p in pipes], [n["id"] for n in nodes], [o["id"] for o in outs])
-    return R, ids
+        rows[row[0]].append(d)
+    R, ids, kind_of = {}, {}, {}
+    for kind, arrs in [("pipe", PIPE_ARRAYS)] + GROUPS:
+        for k in arrs:
+            R[k] = [r[k] for r in rows[kind]]
+            kind_of[k] = kind
+        ids[kind] = [r["id"] for r in rows[kind]]
+    counts = {kind: len(v) for kind, v in rows.items()}
+    return R, ids, counts, kind_of
 
 
 def check(txt, ref, exe, work, verbose):
@@ -66,12 +79,12 @@ def check(txt, ref, exe, work, verbose):
         print("%-14s RUN FAILED: %s" % (base, (r.stdout + r.stderr).strip()[-300:]))
         os.system("grep -i error '%s' | head -5" % rpt)
         return None
-    R, (pid, nid, oid) = read_csv(res)
-    E = read_out(ref, len(pid), len(nid), len(oid))
+    R, idmap, counts, kind_of = read_csv(res)
+    E = read_out(ref, counts)
     worst, worst_key = 0.0, ""
     nbad = 0
-    for key in PIPE_ARRAYS + NODE_ARRAYS + ["oflow", "ohead"]:
-        ids = pid if key in PIPE_ARRAYS else nid if key in NODE_ARRAYS else oid
+    for key in R:
+        ids = idmap[kind_of[key]]
         for i, (x, y) in enumerate(zip(R[key], E[key])):
             d = abs(x - y)
             rel = d / abs(y) if abs(y) > 1e-12 else d
@@ -89,6 +102,48 @@ def check(txt, ref, exe, work, verbose):
     return 0.0 if (si and worst < 1e-10) else worst
 
 
+# InfoSewer engine input/run errors and the swmm5-infosewer error that must match
+ENGINE_TO_SWMM = {"1441": "152", "3900": "144", "1222": "150"}
+
+
+def check_fail(txt, expect, exe, work):
+    """A model the InfoSewer engine refuses: swmm5-infosewer must stop too."""
+    base = os.path.splitext(os.path.basename(txt))[0]
+    inp, rpt, out, res = (os.path.join(work, base + e) for e in (".inp", ".rpt", ".out", ".csv"))
+    if os.path.exists(res):
+        os.unlink(res)
+    subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "ise2inp.py"), txt, inp,
+                    "--mode", "steady", "--results", res], check=True, capture_output=True)
+    subprocess.run([exe, inp, rpt, out], capture_output=True, text=True)
+    want = ENGINE_TO_SWMM.get(expect, "?")
+    errs = [l.strip() for l in open(rpt, encoding="latin-1") if "ERROR " in l]
+    ok = not os.path.exists(res) and any(("ERROR %s:" % want) in e for e in errs)
+    print("%-14s engine Error %s -> %s" % (base, expect, (errs[0] if errs else "no error!")[:110]))
+    return ok
+
+
+def unxz(path, work):
+    """reference files may be stored xz-compressed (X.txt.xz, X.out.xz): give a
+    plain copy in the work folder"""
+    if not path.endswith(".xz"):
+        return path
+    import lzma
+    os.makedirs(os.path.join(work, "ref"), exist_ok=True)
+    plain = os.path.join(work, "ref", os.path.basename(path)[:-3])
+    if not os.path.exists(plain) or os.path.getmtime(plain) < os.path.getmtime(path):
+        with lzma.open(path) as f, open(plain, "wb") as g:
+            g.write(f.read())
+    return plain
+
+
+def find_ref(d, b, ext=".out"):
+    for name in (b + ext, "ref_" + b + ext, "ref_" + b.split("_")[-1] + ext):
+        for p in (os.path.join(d, name), os.path.join(d, name + ".xz")):
+            if os.path.exists(p):
+                return p
+    return None
+
+
 def main(argv):
     exe = os.path.join(ROOT, "bin", "swmm5_is")
     verbose = "-v" in argv
@@ -99,20 +154,30 @@ def main(argv):
         del args[i:i + 2]
     txts = []
     for a in args:
-        txts += sorted(glob.glob(os.path.join(a, "*.txt"))) if os.path.isdir(a) else [a]
+        if os.path.isdir(a):
+            txts += sorted(glob.glob(os.path.join(a, "*.txt")) + glob.glob(os.path.join(a, "*.txt.xz")))
+            txts += sorted(glob.glob(os.path.join(a, "fail", "*.txt")) +
+                           glob.glob(os.path.join(a, "fail", "*.txt.xz")))
+        else:
+            txts.append(a)
     work = os.path.join(HERE, "work_steady")
     os.makedirs(work, exist_ok=True)
     worst = 0.0
     n = 0
     for t in txts:
         d, b = os.path.split(t)
-        b = os.path.splitext(b)[0]
-        ref = next((p for p in (os.path.join(d, b + ".out"), os.path.join(d, "ref_" + b + ".out"),
-                                 os.path.join(d, "ref_" + b.split("_")[-1] + ".out"))
-                    if os.path.exists(p)), None)
+        b = b[:-7] if b.endswith(".txt.xz") else os.path.splitext(b)[0]
+        t = unxz(t, work)
+        expect = os.path.join(d, b + ".engine_error")
+        if os.path.exists(expect):
+            if not check_fail(t, open(expect).read().strip(), exe, work):
+                worst = float("inf")
+            n += 1
+            continue
+        ref = find_ref(d, b)
         if not ref:
             continue
-        w = check(t, ref, exe, work, verbose)
+        w = check(t, unxz(ref, work), exe, work, verbose)
         if w is None:
             worst = float("inf")
         else:

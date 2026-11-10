@@ -1,8 +1,9 @@
 //-----------------------------------------------------------------------------
 //   isewer_eps.c
 //
-//   Project:  swmm5-infosewer (EPA SWMM 5.2.4 + InfoSewer gravity routing)
-//   Purpose:  InfoSewer extended period (EPS, "dynamic") gravity routing.
+//   Project:  swmm5-infosewer (EPA SWMM 5.2.4 + InfoSewer routing)
+//   Purpose:  InfoSewer extended period (EPS, "dynamic") routing: gravity
+//             pipes, wet wells with their pump stations, and siphons.
 //
 //   InfoSewer EPS is not a network time-stepper: each pipe is routed for the
 //   whole run, upstream first, on its own sub-step (spec/eps.md section 1).
@@ -16,7 +17,10 @@
 //     Fv_CalPipeReportData, Fv_OutputPipeFlowRange, Fv_SplitFlow,
 //     Fv_MultiHydSplitFlow, Fv_SinglePrecedeFlow, HU_GetPatternItemValue
 //     (he_util.cpp), Fv_DynamicData / Fv_PipeBackwaterAdjustment (outputs),
-//     He_RunHead (isewer.c).
+//     He_RunHead (isewer.c); for pressure elements Fv_ComputeStationFlow,
+//     Fv_GetStationFlowV2, Fv_GetPointPumpFlowV2, Fv_PumpFlowBisection,
+//     Fv_GetPumpTimeIncrement, Fv_UpdateWellFullPumpStatus,
+//     Fv_GetStandardSiphonFlow, Fv_GetStationSiphonFlow (docs/spec_pressure.md).
 //   Quirks are reproduced on purpose and marked QUIRK.
 //
 //   Written by Claude (AI) for SWMM Enablement, November 2026.
@@ -67,6 +71,21 @@ static double*   MaxT;         // its time (sec, absolute)
 static int*      SegN;         // segments
 static double*   SegDt;        // sub-step
 static double    MbIn, MbOut;  // InfoSewer mass balance terms (ft3)
+static double    MbInitStorage, MbFinalStorage, MbWellOverflow;   // wet wells (ft3)
+static double    StationDt;    // pump station time step (hm_stationDeltaT)
+
+// hydro-event records: link written at each position, topology order of each link
+static int      *LinkOrder, *WriteLink, NWritten, *FmDone;
+static double   *Zero;
+
+// wet well, pump and force main results [report][index]
+static double **RWLevel, **RWVol, **RWPct, **RWOver;
+static double **RPFlow, **RPHead, **RPUsage, **RPSpeed;
+static double **RFFlow, **RFVel, **RFLoss;
+
+// one station's working arrays (mv_pWorkPumpStatus ... mv_pPumpPowerB)
+static double *XStatus, *XUsage, *XSpeed, *XFlow, *XHead, *XOn, *XH0, *XA, *XB, *XPB;
+static double  XUpdatedFlow;    // hm_updatedPumpFlow
 
 // work arrays for one pipe
 static double *WFormer, *WCurrent, *WInflow, *WOutflow, *WIn0, *WSimT, *WHydT;
@@ -105,6 +124,10 @@ static int    computeOutputs(void);
 static void   writeCsv(void);
 static double** alloc2(int n, int m);
 static void   free2(double** a, int n);
+static double* readDF(int l);
+static void   writeRecord(int l);
+static int    routeStation(int k, int l);
+static void   routeSiphon(int k, int l);
 
 //=============================================================================
 
@@ -134,12 +157,27 @@ int isewer_epsInit(void)
     NHyd = (int)(SimDur / H + 1.0 + DOUBLE_TIME_TOL);
     if ( IsMinTravelTime < 1.0 ) IsMinTravelTime = 1.0;     // he_input.cpp:10554
     if ( IsMaxSegments < 1 ) IsMaxSegments = 1000;          // he_input.cpp:10597
+    StationDt = MIN(IsPumpStep, PatStep);                   // he_input.cpp:984
 
     if ( allocAll() ) return ErrorCode;
 
-    // --- route pipes, upstream first
+    // --- topology order of every link (Fv_LinkOrder): its record position
+    NWritten = 0;
+    {
+        int pos = 0;
+        for ( i = 0; i < IsNT; i++ ) LinkOrder[i] = -1;
+        for ( m = 0; m < IsNN; m++ )
+        {
+            TIsNode* nd = &IsNode[IsOrder[m]];
+            if ( nd->kind == IS_NODE_OUTLET ) continue;
+            for ( i = 0; i < nd->ndown; i++ ) LinkOrder[nd->down[i]] = pos++;
+        }
+    }
+
+    // --- route links, upstream first
     MbIn = MbOut = 0.0;
-    for ( m = 0; m < Nobjects[NODE]; m++ )
+    MbInitStorage = MbFinalStorage = MbWellOverflow = 0.0;
+    for ( m = 0; m < IsNN; m++ )
     {
         double** splitArr = NULL;
         TIsNode* nd;
@@ -154,10 +192,24 @@ int isewer_epsInit(void)
         }
         for ( i = 0; i < nd->ndown; i++ )
         {
-            if ( routePipe(k, nd->down[i], i, splitArr) )
+            int l = nd->down[i];
+            if ( IsPipe[l].kind == IS_LINK_STATION )
             {
-                free2(splitArr, nd->ndown);
-                return ErrorCode;
+                if ( routeStation(k, l) ) { free2(splitArr, nd->ndown);  return ErrorCode; }
+                writeRecord(l);
+            }
+            else if ( IsPipe[l].kind == IS_LINK_FM )
+            {
+                if ( !FmDone[l - IsNP] ) routeSiphon(k, l);
+            }
+            else
+            {
+                if ( routePipe(k, l, i, splitArr) )
+                {
+                    free2(splitArr, nd->ndown);
+                    return ErrorCode;
+                }
+                writeRecord(l);
             }
         }
         free2(splitArr, nd->ndown);
@@ -193,7 +245,7 @@ static void free2(double** a, int n)
 
 static int allocAll(void)
 {
-    int i, p, L = Nobjects[LINK], N = Nobjects[NODE];
+    int i, p, L = IsNP, N = IsNN;
 
     // --- expanded patterns (Fv_ReadPattern: each value stored PatInc times)
     PatV = (double**) calloc(IsNpats + 1, sizeof(double*));
@@ -209,16 +261,45 @@ static int allocAll(void)
             for ( r = 0; r < PatInc; r++ ) PatV[p][j * PatInc + r] = IsPats[p].f[j];
     }
 
-    DF = alloc2(L, NHyd + 2);
+    DF = alloc2(IsNT, NHyd + 2);
+    Zero = (double*) calloc(NHyd + 2, sizeof(double));
+    LinkOrder = (int*) calloc(IsNT + 1, sizeof(int));
+    WriteLink = (int*) calloc(IsNT + 1, sizeof(int));
+    FmDone = (int*) calloc(IsNF + 1, sizeof(int));
+    if ( !DF || !Zero || !LinkOrder || !WriteLink || !FmDone ) goto nomem;
+    {
+        int nmax = 1;
+        for ( i = 0; i < IsNStation; i++ ) nmax = MAX(nmax, IsStation[i].npump);
+        XStatus = (double*) calloc(nmax, sizeof(double));
+        XUsage = (double*) calloc(nmax, sizeof(double));
+        XSpeed = (double*) calloc(nmax, sizeof(double));
+        XFlow = (double*) calloc(nmax, sizeof(double));
+        XHead = (double*) calloc(nmax, sizeof(double));
+        XOn = (double*) calloc(nmax, sizeof(double));
+        XH0 = (double*) calloc(nmax, sizeof(double));
+        XA = (double*) calloc(nmax, sizeof(double));
+        XB = (double*) calloc(nmax, sizeof(double));
+        XPB = (double*) calloc(nmax, sizeof(double));
+        if ( !XStatus || !XUsage || !XSpeed || !XFlow || !XHead || !XOn || !XH0 || !XA ||
+             !XB || !XPB ) goto nomem;
+    }
+    RWLevel = alloc2(NRpt, IsNWell);  RWVol = alloc2(NRpt, IsNWell);
+    RWPct = alloc2(NRpt, IsNWell);    RWOver = alloc2(NRpt, IsNWell);
+    RPFlow = alloc2(NRpt, IsNPump);   RPHead = alloc2(NRpt, IsNPump);
+    RPUsage = alloc2(NRpt, IsNPump);  RPSpeed = alloc2(NRpt, IsNPump);
+    RFFlow = alloc2(NRpt, IsNF);      RFVel = alloc2(NRpt, IsNF);
+    RFLoss = alloc2(NRpt, IsNF);
+    if ( !RWLevel || !RWVol || !RWPct || !RWOver || !RPFlow || !RPHead || !RPUsage ||
+         !RPSpeed || !RFFlow || !RFVel || !RFLoss ) goto nomem;
     Raw = (TRptRaw**) calloc(L + 1, sizeof(TRptRaw*));
     NRaw = (int*) calloc(L + 1, sizeof(int));
     MaxQ = (double*) calloc(L + 1, sizeof(double));
     MaxT = (double*) calloc(L + 1, sizeof(double));
     SegN = (int*) calloc(L + 1, sizeof(int));
     SegDt = (double*) calloc(L + 1, sizeof(double));
-    CurQin = (double*) calloc(L + 1, sizeof(double));
-    CurQout = (double*) calloc(L + 1, sizeof(double));
-    CurVol = (double*) calloc(L + 1, sizeof(double));
+    CurQin = (double*) calloc(IsNPM + 1, sizeof(double));
+    CurQout = (double*) calloc(IsNPM + 1, sizeof(double));
+    CurVol = (double*) calloc(IsNPM + 1, sizeof(double));
     CurT = -1.0;
     if ( !DF || !Raw || !NRaw || !MaxQ || !MaxT || !SegN || !SegDt || !CurQin ||
          !CurQout || !CurVol ) goto nomem;
@@ -371,7 +452,7 @@ static int splitFlows(int k, double** out)
     {
         total = nodeLoadTotal(k, simTime);
         MbIn += total * H;
-        for ( m = 0; m < nd->nuph; m++ ) total += DF[nd->uph[m]][ti];
+        for ( m = 0; m < nd->nuph; m++ ) total += readDF(nd->uph[m])[ti];
         // Fv_SplitInfiltrateFlow: percentage pipes first, then hydraulic
         inf = 0.0;
         for ( m = 0; m < npct; m++ ) inf += infilFlow(pct[m], simTime);
@@ -665,8 +746,8 @@ static int routePipe(int k, int i, int downIdx, double** splitArr)
                     for ( m = 0; m < nd->nuph; m++ )
                     {
                         int up = nd->uph[m];
-                        if ( kk <= 1 ) lf0 += interpHydro(DF[up], hT);
-                        lf1 += interpHydro(DF[up], nextHyd);
+                        if ( kk <= 1 ) lf0 += interpHydro(readDF(up), hT);
+                        lf1 += interpHydro(readDF(up), nextHyd);
                     }
                 }
                 else
@@ -787,6 +868,515 @@ static int routePipe(int k, int i, int downIdx, double** splitArr)
 }
 
 //=============================================================================
+//  Hydraulic event records (he_dynamicrun.cpp Fv_ReadHydroData)
+//=============================================================================
+
+static double* readDF(int l)
+//  The engine writes one outflow record per routed link to its hydro-event
+//  file and reads the preceding flows of a node back by each link's
+//  topology order (Fv_LinkOrder). QUIRK: a siphon writes the records of all
+//  its force mains together when its first force main is reached, so links
+//  ordered after a later force main of the chain read a shifted record.
+{
+    int pos = LinkOrder[l];
+    if ( pos < 0 || pos >= NWritten ) return Zero;
+    return DF[WriteLink[pos]];
+}
+
+static void writeRecord(int l)
+{
+    if ( NWritten < IsNT ) WriteLink[NWritten++] = l;
+}
+
+//=============================================================================
+//  Pump stations and wet wells (he_dynamicrun.cpp:2594-4503)
+//=============================================================================
+
+static double wellHeadFromVolume(int w, double volume)
+//  HU_GetWellHeadFromVolume he_util.cpp:1589
+{
+    double v = MIN(volume, IsWell[w].maxVolume);
+    return isewer_wellLevelFromVolume(w, v) + IsWell[w].bottom;
+}
+
+static double wellPercent(int w, double volume)
+//  HU_GetWellPercentVolume he_util.cpp:1626
+{
+    double maxVolume = IsWell[w].maxVolume, pct;
+    if ( volume <= 0.0 || maxVolume <= 0.0 ) return 0.0;
+    pct = volume/maxVolume;
+    pct *= 100.0;
+    return pct;
+}
+
+static int isPoint(int p) { return IsPump[p].type != IS_PUMP_CAPACITY; }
+static double pumpInitStatus(int p) { return IsPump[p].speed < IS_SYS_ZERO ? 0.0 : 1.0; }
+
+static double pumpFlowBisection(TIsStation* st, double siphonFlow, double wellHead)
+//  Fv_PumpFlowBisection he_dynamicrun.cpp:3774
+{
+    int i, n = st->npump, s = st->siphon;
+    double tail = isewer_siphonTailHead(s), loss, functX, functX1, functX11,
+           speedCoef, adjA;
+    for (;;)
+    {
+        loss = isewer_siphonHeadloss(s, siphonFlow);
+        functX = 0.0;  functX11 = 0.0;
+        for ( i = 0; i < n; i++ )
+        {
+            functX1 = 0.0;
+            if ( XOn[i] > 0 && isPoint(st->pump[i]) )
+            {
+                functX = wellHead - tail - loss + pow(XSpeed[i], 2.0)*XH0[i];
+                if ( functX < 0.0 ) break;
+                speedCoef = pow(XSpeed[i], XB[i] - 2.0);
+                adjA = XA[i]/speedCoef;
+                functX1 = pow(functX/adjA, 1.0/XB[i]);
+            }
+            functX11 += functX1;
+        }
+        if ( functX < 0.0 ) { siphonFlow = 0.99*siphonFlow;  continue; }
+        break;
+    }
+    XUpdatedFlow = siphonFlow;
+    return functX11 - siphonFlow;
+}
+
+static int pointPumpFlow(TIsStation* st, int pumpIndex, double wellHead)
+//  Fv_GetPointPumpFlowV2 he_dynamicrun.cpp:3434: Newton on the station flow
+//  (pumpIndex = the station's LAST pump), bisection if Newton fails.
+//  Returns 1 when the engine stops (Error 3900).
+{
+    int i, n = st->npump, s = st->siphon, parallelCount = IsPump[pumpIndex].parallel;
+    int iter = 0, maxIter = 50;
+    double tail = isewer_siphonTailHead(s), pumpFlow = 0.0, maxPumpHead = 100000000.0,
+           limiting, siphonFlow, loss = 0.0, newQ = 0.0, deltaFlow = 1000.0,
+           speedCoef, adjA, prevFX = 0.0, prevQ = 0.0, tolLim = 0.0001, functX = 0.0;
+
+    for ( i = 0; i < n; i++ )
+    {
+        int p = st->pump[i];
+        if ( XSpeed[i] == 0.0 ) XSpeed[i] = 1.0;
+        if ( XOn[i] > 0 && isPoint(p) ) pumpFlow += parallelCount*IsPump[p].flow1;
+    }
+    for ( i = 0; i < n; i++ )
+        if ( XOn[i] > 0 ) maxPumpHead = MIN(maxPumpHead, pow(XSpeed[i], 2.0)*XH0[i]);
+    limiting = maxPumpHead - (tail - wellHead);
+    if ( limiting <= 0.0 )
+    {
+        for ( i = 0; i < n; i++ ) { XFlow[i] = 0.0;  XHead[i] = 0.0; }
+        return 0;
+    }
+    siphonFlow = pumpFlow;
+    while ( (deltaFlow > tolLim) && (iter <= maxIter) )
+    {
+        double functX1, functX11 = 0.0, functX12, functX2, functX21, functX22 = 0.0,
+               functX23, functP;
+        for (;;)                                   // tryAgain
+        {
+            iter++;
+            loss = isewer_siphonHeadloss(s, siphonFlow);
+            if ( loss > limiting ) { siphonFlow = siphonFlow/2.0;  pumpFlow = siphonFlow;  continue; }
+            break;
+        }
+        functX = 0.0;
+        for ( i = 0; i < n; i++ )
+        {
+            int p = st->pump[i];
+            functX1 = 0.0;  functX21 = 0.0;
+            if ( XOn[i] > 0 && isPoint(p) )
+            {
+                double siphonFactor;
+                functX = wellHead - tail - loss + pow(XSpeed[i], 2.0)*XH0[i];
+                if ( functX < 0.0 ) break;
+                speedCoef = pow(XSpeed[i], XB[i] - 2.0);
+                adjA = XA[i]/speedCoef;
+                functX1 = pow(functX/adjA, 1.0/XB[i]);
+                functP = pow(functX, 1.0/XB[i] - 1)/pow(adjA, 1.0/XB[i]);
+                functX2 = (1.0/XB[i])*functP;
+                siphonFactor = isewer_siphonNewtonFactor(s, siphonFlow);
+                functX21 = functX2*siphonFactor;
+            }
+            functX11 += functX1;
+            functX22 += functX21;
+        }
+        if ( functX >= 0.0 )
+        {
+            functX12 = pumpFlow - functX11;
+            functX23 = 1 + functX22;
+            if ( fabs(functX23) <= IsFlowTol ) newQ = pumpFlow - IsFlowTol;
+            else newQ = pumpFlow - functX12/functX23;
+            if ( newQ < 0.0001 )
+            {
+                for ( i = 0; i < n; i++ ) { XFlow[i] = 0.0;  XHead[i] = 0.0; }
+                return 0;
+            }
+            prevFX = functX;
+            deltaFlow = fabs((newQ - pumpFlow)/newQ);
+            prevQ = pumpFlow;
+            pumpFlow = newQ;
+            siphonFlow = pumpFlow;
+        }
+        else
+        {
+            if ( pumpFlow <= 0.001 )
+            {
+                for ( i = 0; i < n; i++ ) { XFlow[i] = 0.0;  XHead[i] = 0.0; }
+                return 0;
+            }
+            if ( prevFX >= 0.0 )
+            {
+                pumpFlow = 0.5*(pumpFlow + prevQ);
+                prevQ = siphonFlow;
+                deltaFlow = fabs((pumpFlow - prevQ)/pumpFlow);
+                siphonFlow = pumpFlow;
+            }
+            else
+            {
+                pumpFlow = 0.5*pumpFlow;
+                prevQ = siphonFlow;
+                deltaFlow = fabs((pumpFlow - prevQ)/pumpFlow);
+                siphonFlow = pumpFlow;
+            }
+            prevFX = functX;
+        }
+    }
+    if ( deltaFlow > tolLim )                      // bisection
+    {
+        int bIter = 0;
+        double lowerQ, upperQ = 5.0*IsPump[pumpIndex].flow2, lowerF, upperF, avgQ, avgF;
+#ifdef ISEWER_TRACE
+        fprintf(stderr, "ISEWER_TRACE eps bisection pump %s\n", Link[IsPump[pumpIndex].swmm].ID);
+#endif
+        lowerF = pumpFlowBisection(st, 0.00001, wellHead);  lowerQ = XUpdatedFlow;
+        upperF = pumpFlowBisection(st, upperQ, wellHead);   upperQ = XUpdatedFlow;
+        avgQ = 0.5*(lowerQ + upperQ);
+        avgF = pumpFlowBisection(st, avgQ, wellHead);       avgQ = XUpdatedFlow;
+        do
+        {
+            if ( (avgF*upperF) <= 0.0 )
+            {
+                lowerQ = avgQ;
+                lowerF = pumpFlowBisection(st, lowerQ, wellHead);  lowerQ = XUpdatedFlow;
+            }
+            else if ( (avgF*lowerF) <= 0.0 )
+            {
+                upperQ = avgQ;
+                upperF = pumpFlowBisection(st, upperQ, wellHead);  upperQ = XUpdatedFlow;
+            }
+            else
+            {
+                upperQ = 1.01*upperQ;
+                upperF = pumpFlowBisection(st, upperQ, wellHead);  upperQ = XUpdatedFlow;
+            }
+            avgQ = 0.5*(lowerQ + upperQ);
+            avgF = pumpFlowBisection(st, avgQ, wellHead);  avgQ = XUpdatedFlow;
+            bIter++;
+        } while ( ((fabs(avgF)/avgQ) >= 0.001) && (bIter < 100) );
+        siphonFlow = avgQ;
+        if ( bIter >= 100 ) return 1;
+    }
+    loss = isewer_siphonHeadloss(s, siphonFlow);
+    for ( i = 0; i < n; i++ )
+    {
+        if ( XOn[i] > 0 && isPoint(st->pump[i]) )
+        {
+            functX = wellHead - tail - loss + pow(XSpeed[i], 2.0)*XH0[i];
+            speedCoef = pow(XSpeed[i], XB[i] - 2.0);
+            adjA = XA[i]/speedCoef;
+            XFlow[i] = pow(functX/adjA, 1.0/XB[i]);
+            XHead[i] = pow(XSpeed[i], 2.0)*XH0[i] - adjA*pow(fabs(XFlow[i]), XB[i]);
+            XHead[i] = MAX(0.0, XHead[i]);
+        }
+    }
+    return 0;
+}
+
+static int stationFlow(TIsStation* st, double currVolume, double* stationQ)
+//  Fv_GetStationFlowV2 he_dynamicrun.cpp:3020. Returns 1 when the engine stops.
+{
+    int i, n = st->npump, numOff = 0, pLast;
+    double flow = 0.0;
+    for ( i = 0; i < n; i++ ) XOn[i] = 1.0;
+    for ( i = 0; i < n; i++ )
+        if ( XStatus[i] < IS_SYS_ZERO )
+        {
+            XHead[i] = 0.0;  XFlow[i] = 0.0;  XOn[i] = 0.0;
+            numOff += 1;
+        }
+    if ( numOff < n )
+    {
+        for ( i = 0; i < n; i++ )
+        {
+            TIsPump* pu = &IsPump[st->pump[i]];
+            if ( XOn[i] > 0 && pu->type == IS_PUMP_CAPACITY )
+            {
+                // QUIRK: the head uses parallel x (parallel x capacity)
+                double totalFlow, tail, loss, wellHead;
+                XFlow[i] = pu->parallel*pu->capacity;
+                flow += XFlow[i];
+                totalFlow = pu->parallel*XFlow[i];
+                tail = isewer_siphonTailHead(st->siphon);
+                loss = isewer_siphonHeadloss(st->siphon, totalFlow);
+                wellHead = wellHeadFromVolume(pu->wetwell, currVolume);
+                XHead[i] = tail + loss - wellHead;
+                XHead[i] = MAX(0.0, XHead[i]);
+            }
+        }
+        pLast = st->pump[n - 1];
+        if ( isPoint(pLast) )
+        {
+            double wellHead;
+            for ( i = 0; i < n; i++ )
+            {
+                TIsPump* pu = &IsPump[st->pump[i]];
+                if ( XOn[i] > 0 )
+                {
+                    XH0[i] = pu->head0;
+                    if ( XH0[i] == 0 ) XH0[i] = 1.33*pu->head1;
+                    XA[i] = pu->a;
+                    XB[i] = pu->b;
+                    if ( XB[i] != 0.0 ) XPB[i] = (1.0/XB[i]) - 1.0;
+                }
+            }
+            wellHead = wellHeadFromVolume(IsPump[pLast].wetwell, currVolume);
+            if ( pointPumpFlow(st, pLast, wellHead) ) return 1;
+            flow = 0.0;
+            for ( i = 0; i < n; i++ ) flow += XFlow[i];
+        }
+    }
+    else
+    {
+        for ( i = 0; i < n; i++ ) { XHead[i] = 0.0;  XFlow[i] = 0.0; }
+    }
+    *stationQ = flow;
+    return 0;
+}
+
+static void wellFullPumpStatus(TIsStation* st)
+//  Fv_UpdateWellFullPumpStatus he_dynamicrun.cpp:4429
+{
+    int i, n = st->npump, enforce = 1;
+    if ( n > 1 )
+        for ( i = 0; i < n; i++ )
+            if ( pumpInitStatus(st->pump[i]) > IS_SYS_ZERO ) { enforce = 0;  break; }
+    for ( i = 0; i < n; i++ )
+    {
+        if ( enforce )
+        {
+            XStatus[i] = 1.0;
+            if ( XSpeed[i] == 0.0 ) XSpeed[i] = 1.0;
+        }
+        else if ( pumpInitStatus(st->pump[i]) > IS_SYS_ZERO )
+        {
+            XStatus[i] = 1.0;
+            if ( XSpeed[i] <= 0.0 ) XSpeed[i] = 1.0;
+        }
+    }
+}
+
+static double pumpTimeIncrement(TIsStation* st, double deltaTimeInc, double stationQ,
+                                double inflow, double currVolume, int precedeCount)
+//  Fv_GetPumpTimeIncrement he_dynamicrun.cpp:4232 (no pump controls)
+{
+    TIsWetWell* w = &IsWell[st->wetwell];
+    int i, n = st->npump;
+    double timeIncrement = StationDt, flowRate = inflow - stationQ, nextVolume, wellTimeInc;
+    nextVolume = MAX(0.0, (currVolume + flowRate*timeIncrement));
+    if ( (fabs(flowRate) < IS_ZERO_TOL) && (precedeCount != 0) ) return timeIncrement;
+    for ( i = 0; i < n; i++ ) XUsage[i] = XStatus[i];
+    if ( deltaTimeInc > 0.0 ) timeIncrement = MIN(timeIncrement, deltaTimeInc);
+    if ( nextVolume > (w->maxVolume - IS_ZERO_TOL) )
+    {
+        wellTimeInc = (w->maxVolume - currVolume)/flowRate;
+        if ( wellTimeInc < (timeIncrement - DOUBLE_TIME_TOL) )
+        {
+            timeIncrement = wellTimeInc + DOUBLE_TIME_TOL;
+            wellFullPumpStatus(st);
+        }
+    }
+    else if ( nextVolume < (w->minVolume + IS_ZERO_TOL) )
+    {
+        wellTimeInc = -(currVolume - w->minVolume)/flowRate;
+        if ( wellTimeInc < (timeIncrement - DOUBLE_TIME_TOL) )
+        {
+            timeIncrement = wellTimeInc + DOUBLE_TIME_TOL;
+            for ( i = 0; i < n; i++ ) XStatus[i] = 0.0;
+        }
+    }
+    if ( timeIncrement < DOUBLE_TIME_TOL ) return StationDt;
+    return timeIncrement;
+}
+
+static int routeStation(int k, int l)
+//  Fv_ComputeStationFlow he_dynamicrun.cpp:2594: the wet well and its pumps
+//  for the whole run on the pump time step. Returns non-zero on error.
+{
+    TIsNode* nd = &IsNode[k];
+    TIsStation* st = &IsStation[IsPipe[l].station];
+    int w = st->wetwell, n = st->npump, i, j, reportIndex = 0, hydroIndex = 0;
+    TIsWetWell* ww = &IsWell[w];
+    double currVolume = MAX(0.0, ww->initVolume), nextVolume, simTime = StartT,
+           hydTime = 0.0, timeIncrement, stationQ = 0.0, overflow, reportVolume = 0.0;
+    double* DFs = DF[l];
+
+    MbInitStorage += currVolume;
+    for ( j = 0; j <= NHyd; j++ ) DFs[j] = 0.0;
+    for ( i = 0; i < n; i++ )
+    {
+        int p = st->pump[i];
+        XStatus[i] = (IsPump[p].speed < IS_SYS_ZERO) ? 0.0 : 1.0;   // usage
+        XSpeed[i] = IsPump[p].speed;
+        XFlow[i] = XHead[i] = 0.0;
+        if ( XSpeed[i] <= 0.0 ) XStatus[i] = 0.0;
+        // Fv_UpdatePumpInitStatus (2863): wet well levels
+        if ( currVolume > (ww->maxVolume - IS_ZERO_TOL) ) XStatus[i] = 1.0;
+        else if ( currVolume < (ww->minVolume + IS_ZERO_TOL) ) XStatus[i] = 0.0;
+        XUsage[i] = XStatus[i];
+    }
+    while ( simTime <= (EndT + StationDt) )
+    {
+        double prevInflow = 0.0, nextInflow = 0.0, deltaTime, inflow, deltaTimeInc;
+        for ( j = 0; j < nd->nuph; j++ )
+        {
+            double* a = readDF(nd->uph[j]);
+            if ( hydroIndex == 0 ) prevInflow = 0;
+            else prevInflow += a[hydroIndex - 1];
+            nextInflow += a[hydroIndex];
+        }
+        deltaTime = hydTime - (hydroIndex - 1)*H;
+        if ( fabs(deltaTime) <= ZERO_TIME_VALUE ) deltaTime = 0.0;
+        inflow = prevInflow + deltaTime*(nextInflow - prevInflow)/H;
+        if ( stationFlow(st, currVolume, &stationQ) )
+        {
+            report_writeErrorMsg(ERR_ISEWER_PUMPFLOW, Link[IsPump[st->pump[0]].swmm].ID);
+            return ErrorCode;
+        }
+        deltaTimeInc = H*hydroIndex - hydTime;
+        timeIncrement = pumpTimeIncrement(st, deltaTimeInc, stationQ, inflow, currVolume,
+                                          nd->nuph);
+        nextVolume = currVolume + (inflow - stationQ)*timeIncrement;
+        if ( hydroIndex < NHyd )
+        {
+            if ( hydTime > H*hydroIndex )
+            {
+                if ( stationQ > IsFlowTol )
+                {
+                    double dF = stationQ - DFs[hydroIndex - 1];
+                    double dT = hydTime - (hydroIndex - 1)*H;
+                    DFs[hydroIndex] = MAX(0.0, DFs[hydroIndex - 1] + H*dF/dT);
+                }
+                else DFs[hydroIndex] = 0.0;
+                hydroIndex++;
+            }
+            else if ( fabs(hydTime - hydroIndex*H) < DOUBLE_TIME_TOL )
+            {
+                DFs[hydroIndex] = stationQ;
+                hydroIndex++;
+            }
+            else if ( hydTime < DOUBLE_TIME_TOL )
+            {
+                DFs[hydroIndex] = stationQ;
+                hydroIndex++;
+            }
+        }
+        if ( hydTime >= (reportIndex*RptStep - DOUBLE_TIME_TOL) && reportIndex < NRpt )
+        {
+            // Fv_AssignStationWellResult (4169)
+            reportVolume = MAX(0.0, currVolume);
+            if ( reportVolume > ww->maxVolume )
+            {
+                overflow = reportVolume - ww->maxVolume;
+                reportVolume = ww->maxVolume;
+            }
+            else overflow = 0.0;
+            for ( i = 0; i < n; i++ )
+            {
+                int p = st->pump[i];
+                double usage = 0.0;
+                if ( (XUsage[i] > 0.0) && (XFlow[i] > 0.0) ) usage = IsPump[p].parallel;
+                RPUsage[reportIndex][p] = usage;
+                RPFlow[reportIndex][p] = XFlow[i];
+                RPHead[reportIndex][p] = XHead[i];
+                RPSpeed[reportIndex][p] = XSpeed[i];
+            }
+            RWVol[reportIndex][w] = reportVolume;
+            RWOver[reportIndex][w] = overflow;
+            RWPct[reportIndex][w] = wellPercent(w, reportVolume);
+            RWLevel[reportIndex][w] = isewer_wellLevelFromVolume(w, reportVolume);
+            reportIndex++;
+        }
+        simTime += timeIncrement;
+        hydTime += timeIncrement;
+        currVolume = nextVolume;
+    }
+    MbFinalStorage += reportVolume;
+    return 0;
+}
+
+//=============================================================================
+//  Siphons (Fv_CheckForceMainLink he_dynamicrun.cpp:4503)
+//=============================================================================
+
+static void routeSiphon(int k, int l)
+//  Fv_GetStandardSiphonFlow (4588) / Fv_GetStationSiphonFlow (4820): force
+//  main flows at report times and the siphon's outflow record.
+{
+    TIsNode* nd = &IsNode[k];
+    TIsSiphon* sp = &IsSiphon[IsPipe[l].siphon];
+    int i, j, f, ratio = (int)(RptStep/H + DOUBLE_TIME_TOL);
+    double *rec = DF[sp->fm[0]], v, hl;
+
+    if ( sp->type == IS_SIPHON_STANDARD )
+    {
+        int head = IsPipe[sp->fm[0]].frm, loadNode = (IsNode[head].kind == IS_NODE_LOAD);
+        for ( i = 0; i < NHyd; i++ )
+        {
+            rec[i] = 0.0;
+            for ( j = 0; j < nd->nuph; j++ ) rec[i] += readDF(nd->uph[j])[i];
+            if ( loadNode ) rec[i] += nodeLoadTotal(head, StartT + i*H);
+        }
+        for ( f = 0; f < sp->nfm; f++ )
+        {
+            int fl = sp->fm[f];
+            for ( j = 0; j < NRpt; j++ )
+            {
+                // Fv_GetSiphonInflow (4761)
+                int he = j*ratio;
+                double q = 0.0;
+                for ( i = 0; i < nd->nuph; i++ ) q += readDF(nd->uph[i])[he];
+                if ( loadNode ) q += nodeLoadTotal(head, StartT + he*H);
+                isewer_fmHydraulics(fl, q, &v, &hl);
+                RFFlow[j][fl - IsNP] = q;  RFVel[j][fl - IsNP] = v;  RFLoss[j][fl - IsNP] = hl;
+            }
+        }
+    }
+    else
+    {
+        // QUIRK: report j takes the station's hydraulic-step flow j
+        double* st = DF[IsStation[sp->station].link];
+        for ( i = 0; i <= NHyd; i++ ) rec[i] = st[i];
+        for ( f = 0; f < sp->nfm; f++ )
+        {
+            int fl = sp->fm[f];
+            for ( j = 0; j < NRpt; j++ )
+            {
+                double q = st[j];
+                isewer_fmHydraulics(fl, q, &v, &hl);
+                RFFlow[j][fl - IsNP] = q;  RFVel[j][fl - IsNP] = v;  RFLoss[j][fl - IsNP] = hl;
+            }
+        }
+    }
+    for ( f = 0; f < sp->nfm; f++ )
+    {
+        int fl = sp->fm[f];
+        if ( fl != sp->fm[0] ) for ( i = 0; i <= NHyd; i++ ) DF[fl][i] = rec[i];
+        writeRecord(fl);
+        FmDone[fl - IsNP] = 1;
+    }
+}
+
+//=============================================================================
 //  Report-time outputs (spec 6)
 //=============================================================================
 
@@ -794,10 +1384,19 @@ static int computeOutputs(void)
 //  Fv_DynamicData / Fv_ReadPipeMainResultFromFile / Fv_PipeBackwaterAdjustment
 //  for every report step (eps_ref.py:outputs).
 {
-    int r, i, k, m, L = Nobjects[LINK], N = Nobjects[NODE];
-    double *up, *dep, *vel, *upAdj, *head;
+    int r, i, k, m, L = IsNP, N = IsNN;
+    double *up, *dep, *vel, *upAdj, *head, *hq, *wellHead, *pumpHead;
     int *ftype, *partial, *adjFull;
 
+    hq = (double*) calloc(IsNLE + 1, sizeof(double));
+    wellHead = (double*) calloc(IsNWell + 1, sizeof(double));
+    pumpHead = (double*) calloc(IsNPump + 1, sizeof(double));
+    if ( !hq || !wellHead || !pumpHead )
+    {
+        FREE(hq); FREE(wellHead); FREE(pumpHead);
+        report_writeErrorMsg(ERR_MEMORY, "");
+        return ErrorCode;
+    }
     up = (double*) calloc(L + 1, sizeof(double));
     dep = (double*) calloc(L + 1, sizeof(double));
     vel = (double*) calloc(L + 1, sizeof(double));
@@ -831,7 +1430,25 @@ static int computeOutputs(void)
             OFroude[r][i] = fr;
             if ( r == NRpt - 1 && r > 0 ) PipeStorage += a * p->count * p->length;
         }
-        isewer_runHead(up, dep, head, ftype, partial, adjFull, 0);
+        // --- Fv_DynamicGetHead (11352): link flows of pipes, force mains and
+        //     stations (sum of pump flows), pump heads, wet well heads
+        for ( i = 0; i <= IsNLE; i++ ) hq[i] = 0.0;
+        for ( i = 0; i < L; i++ ) hq[i] = up[i];
+        for ( i = 0; i < IsNF; i++ ) hq[IsNP + i] = RFFlow[r][i];
+        for ( i = 0; i < IsNStation; i++ )
+        {
+            double q = 0.0;
+            for ( m = 0; m < IsStation[i].npump; m++ ) q += RPFlow[r][IsStation[i].pump[m]];
+            hq[IsNPM + i] = q;
+        }
+        for ( i = 0; i < IsNPump; i++ ) pumpHead[i] = RPHead[r][i];
+        for ( i = 0; i < IsNWell; i++ ) wellHead[i] = RWLevel[r][i] + IsWell[i].bottom;
+        isewer_setHeadPressureData(wellHead, pumpHead);
+        if ( isewer_runHead(hq, dep, head, ftype, partial, adjFull, 0) )
+        {
+            report_writeErrorMsg(ERR_ISEWER_LINK, "(head sweep)");
+            break;
+        }
 
         // --- Fv_PipeFlow: QUIRK adverse pipes take the sum of the pipes
         //     entering their from-node, in place, in input order
@@ -902,18 +1519,24 @@ static int computeOutputs(void)
                 OOutflow[r][k] = q;
                 continue;
             }
+            if ( nd->kind != IS_NODE_LOAD ) continue;
             OStatus[r][k] = head[k] >= nd->rim ? 1.0 : 0.0;
             {
+                // gravity pipes only (Fv_ReadPipeMainResultFromFile 14762)
                 int upSuper = 0, dnSub = 0;
-                for ( m = 0; m < nd->nuph; m++ ) if ( OFroude[r][nd->uph[m]] > 1 ) upSuper = 1;
-                for ( m = 0; m < nd->ndown; m++ ) if ( OFroude[r][nd->down[m]] < 1 ) dnSub = 1;
+                for ( m = 0; m < nd->nuph; m++ )
+                    if ( nd->uph[m] < L && OFroude[r][nd->uph[m]] > 1 ) upSuper = 1;
+                for ( m = 0; m < nd->ndown; m++ )
+                    if ( nd->down[m] < L && OFroude[r][nd->down[m]] < 1 ) dnSub = 1;
                 OJump[r][k] = (upSuper && dnSub) ? 1.0 : 0.0;
             }
             OLoad[r][k] = nodeLoadTotal(k, StartT + r * RptStep);
         }
+        if ( r == NRpt - 1 )
+            for ( i = 0; i < IsNWell; i++ ) MbWellOverflow += MAX(0.0, RWOver[r][i]);
     }
     FREE(up); FREE(dep); FREE(vel); FREE(upAdj); FREE(head); FREE(ftype);
-    FREE(partial); FREE(adjFull);
+    FREE(partial); FREE(adjFull); FREE(hq); FREE(wellHead); FREE(pumpHead);
     return 0;
 }
 
@@ -930,7 +1553,7 @@ void isewer_epsSetState(double tSec)
 //  balance), starting empty as InfoSewer does. Depth stays InfoSewer's
 //  reported normal depth.
 {
-    int r0, r1, i, j, L = Nobjects[LINK], N = Nobjects[NODE];
+    int r0, r1, i, k, L = IsNP, N = IsNN;
     double x, f;
     if ( !OFlow ) return;
     x = tSec / RptStep;
@@ -942,7 +1565,7 @@ void isewer_epsSetState(double tSec)
     r1 = (f > 0.0) ? r0 + 1 : r0;
     for ( i = 0; i < L; i++ )
     {
-        int k = Link[i].subIndex;
+        int j = IsPipe[i].swmm, c = Link[j].subIndex;
         double q, y, a, qin, qout;
         if ( f == 0.0 )
         {
@@ -962,22 +1585,46 @@ void isewer_epsSetState(double tSec)
         else CurVol[i] += 0.5 * ((CurQin[i] + qin) - (CurQout[i] + qout)) * (tSec - CurT);
         CurQin[i] = qin;
         CurQout[i] = qout;
-        a = (y > 0.0) ? xsect_getAofY(&Link[i].xsect, y) : 0.0;
-        Link[i].newFlow = q;
-        Link[i].newDepth = y;
-        Conduit[k].q1 = CurQin[i] / Conduit[k].barrels;
-        Conduit[k].q2 = CurQout[i] / Conduit[k].barrels;
-        Conduit[k].a1 = Conduit[k].a2 = a;
-        Link[i].newVolume = CurVol[i];
+        a = (y > 0.0) ? xsect_getAofY(&Link[j].xsect, y) : 0.0;
+        Link[j].newFlow = q;
+        Link[j].newDepth = y;
+        Conduit[c].q1 = CurQin[i] / Conduit[c].barrels;
+        Conduit[c].q2 = CurQout[i] / Conduit[c].barrels;
+        Conduit[c].a1 = Conduit[c].a2 = a;
+        Link[j].newVolume = CurVol[i];
+    }
+    // --- force mains run full: flow in = flow out, volume constant
+    for ( i = IsNP; i < IsNPM; i++ )
+    {
+        int j = IsPipe[i].swmm, c = Link[j].subIndex, fi = i - IsNP;
+        double q = (f == 0.0) ? RFFlow[r0][fi] : (1.0 - f) * RFFlow[r0][fi] + f * RFFlow[r1][fi];
+        double a = Link[j].xsect.aFull;
+        q = MAX(q, 0.0);
+        CurQin[i] = CurQout[i] = q;
+        Link[j].newFlow = q;
+        Link[j].newDepth = Link[j].xsect.yFull;
+        Conduit[c].q1 = Conduit[c].q2 = q / Conduit[c].barrels;
+        Conduit[c].a1 = Conduit[c].a2 = a;
+        Link[j].newVolume = a * link_getLength(j) * Conduit[c].barrels;
+    }
+    // --- pumps: the element flow InfoSewer reports
+    for ( i = 0; i < IsNPump; i++ )
+    {
+        int j = IsPump[i].swmm;
+        double q = (f == 0.0) ? RPFlow[r0][i] : (1.0 - f) * RPFlow[r0][i] + f * RPFlow[r1][i];
+        Link[j].newFlow = MAX(q, 0.0);
+        Link[j].newDepth = 0.0;
+        Link[j].newVolume = 0.0;
     }
     CurT = tSec;
-    for ( j = 0; j < N; j++ )
+    for ( k = 0; k < N; k++ )
     {
-        double h = (f == 0.0) ? OHead[r0][j] : (1.0 - f) * OHead[r0][j] + f * OHead[r1][j];
+        int j = IsNode[k].swmm;
+        double h = (f == 0.0) ? OHead[r0][k] : (1.0 - f) * OHead[r0][k] + f * OHead[r1][k];
         double y = h - Node[j].invertElev;
         if ( y < 0.0 ) y = 0.0;
         Node[j].newDepth = y;
-        Node[j].newVolume = 0.0;
+        Node[j].newVolume = (Node[j].type == STORAGE) ? node_getVolume(j, y) : 0.0;
         Node[j].overflow = 0.0;
     }
 }
@@ -988,10 +1635,17 @@ void isewer_epsNodeFlows(void)
 //  its downstream node.
 {
     int i;
-    for ( i = 0; i < Nobjects[LINK]; i++ )
+    for ( i = 0; i < IsNPM; i++ )
     {
-        Node[Link[i].node1].outflow += CurQin[i];
-        Node[Link[i].node2].inflow  += CurQout[i];
+        int j = IsPipe[i].swmm;
+        Node[Link[j].node1].outflow += CurQin[i];
+        Node[Link[j].node2].inflow  += CurQout[i];
+    }
+    for ( i = 0; i < IsNPump; i++ )
+    {
+        int j = IsPump[i].swmm;
+        Node[Link[j].node1].outflow += Link[j].newFlow;
+        Node[Link[j].node2].inflow  += Link[j].newFlow;
     }
 }
 
@@ -1002,14 +1656,14 @@ void isewer_epsLoads(double tSec)
     int k, m;
     double t = StartT + tSec, q;
     if ( !OFlow ) return;
-    for ( k = 0; k < Nobjects[NODE]; k++ )
+    for ( k = 0; k < IsNN; k++ )
     {
         TIsNode* nd = &IsNode[k];
         if ( nd->isOutlet ) continue;
         q = nodeLoadTotal(k, t);
         for ( m = 0; m < nd->ndown; m++ ) q += infilFlow(nd->down[m], t);
         if ( q == 0.0 ) continue;
-        Node[k].newLatFlow += q;
+        Node[nd->swmm].newLatFlow += q;
         massbal_addInflowFlow(DRY_WEATHER_INFLOW, q);
     }
 }
@@ -1028,14 +1682,21 @@ static void milTime(double t, char* s)
 
 void isewer_epsReport(void)
 {
-    int i, L = Nobjects[LINK];
+    int i, L = IsNP;
     double ff = IsFlowFactor, lf = UCF(LENGTH), check, stor;
     FILE* f = Frpt.file;
     char ts[32];
     if ( !f || RptFlags.disabled || !OFlow ) return;
 
-    stor = PipeStorage;
-    check = MbIn != 0.0 ? fabs(100.0 * (MbIn - (MbOut + stor)) / MbIn) : 0.0;
+    // he_dynamicrun.cpp:14862: QUIRK the printed storage is half of what
+    // Fv_ReadPipeMainResultFromFile accumulated, and the link report re-reads
+    // the results, so without a link report InfoSewer prints half the storage
+    stor = IsLinkReport ? PipeStorage : 0.5 * PipeStorage;
+    {
+        double tflow = MbOut + MbFinalStorage + stor + MbWellOverflow;
+        double in = MbIn + MbInitStorage;
+        check = in != 0.0 ? fabs(100.0 * (in - tflow) / in) : 0.0;
+    }
     fprintf(f,
 "\n  ***************************************"
 "\n  InfoSewer EPS Maximum Gravity Pipe Flows"
@@ -1055,7 +1716,7 @@ void isewer_epsReport(void)
         v = isewer_pipeVelocity(d, 0.5 * p->dia, q);
         if ( d / p->dia < IS_DD_TOL ) { d = 0.0;  v = 0.0; }
         milTime(MaxT[i], ts);
-        fprintf(f, "\n  %-20s %12.4f   %s %10.3f %9.3f %10d %10.1f", Link[i].ID,
+        fprintf(f, "\n  %-20s %12.4f   %s %10.3f %9.3f %10d %10.1f", Link[p->swmm].ID,
             MaxQ[i] * ff, ts, v * lf, d / p->dia, SegN[i], SegDt[i]);
     }
     fprintf(f,
@@ -1064,18 +1725,22 @@ void isewer_epsReport(void)
 "\n  ***************************************"
 "\n  Inflow volume ............ %14.3f ft3"
 "\n  Outflow volume ........... %14.3f ft3"
+"\n  Initial wet well storage . %14.3f ft3"
+"\n  Final wet well storage ... %14.3f ft3"
+"\n  Wet well flooding ........ %14.3f ft3"
 "\n  Final pipe storage ....... %14.3f ft3"
 "\n  Check (%%) ................ %14.3f"
-"\n  InfoSewer integrates inflow to the end time plus one sub-step and counts"
-"\n  split manholes for one extra hydraulic step; see the README.\n",
-    MbIn, MbOut, stor, check);
+"\n  InfoSewer integrates inflow to the end time plus one sub-step, counts"
+"\n  split manholes for one extra hydraulic step and leaves out the loads of"
+"\n  manholes that feed force mains; see the README.\n",
+    MbIn, MbOut, MbInitStorage, MbFinalStorage, MbWellOverflow, stor, check);
 }
 
 static void writeCsv(void)
 //  Every InfoSewer EPS output array at full precision, internal units
 //  (cfs, ft), one block per report time, for verification.
 {
-    int r, i, k, L = Nobjects[LINK], N = Nobjects[NODE];
+    int r, i, k, L = IsNP, N = IsNN;
     FILE* f = fopen(IsResultsFile, "wt");
     if ( !f ) { report_writeErrorMsg(ERR_RPT_FILE, IsResultsFile); return; }
     fprintf(f, "kind,report,id,flow,vel,depth,froude,dD,overflow,backwater,adjdepth,"
@@ -1084,26 +1749,53 @@ static void writeCsv(void)
         for ( i = 0; i < L; i++ )
             fprintf(f, "pipe,%d,%s,%.17g,%.17g,%.17g,%.17g,%.17g,0,%.17g,%.17g,%.17g,"
                        "%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
-                r, Link[i].ID, OFlow[r][i], OVel[r][i], ODepth[r][i], OFroude[r][i],
+                r, Link[IsPipe[i].swmm].ID, OFlow[r][i], OVel[r][i], ODepth[r][i], OFroude[r][i],
                 OdD[r][i], OBack[r][i], OAdjD[r][i], OAdjV[r][i], OqQ[r][i],
                 OFtype[r][i], OPartial[r][i], OUp[r][i], ODn[r][i], OIn[r][i]);
     fprintf(f, "kind,report,id,load,head,status,jump\n");
     for ( r = 0; r < NRpt; r++ )
         for ( k = 0; k < N; k++ )
-            if ( !IsNode[k].isOutlet )
-                fprintf(f, "node,%d,%s,%.17g,%.17g,%.17g,%.17g\n", r, Node[k].ID,
+            if ( IsNode[k].kind == IS_NODE_LOAD )
+                fprintf(f, "node,%d,%s,%.17g,%.17g,%.17g,%.17g\n", r, Node[IsNode[k].swmm].ID,
                     OLoad[r][k], OHead[r][k], OStatus[r][k], OJump[r][k]);
     fprintf(f, "kind,report,id,outflow,outhead\n");
     for ( r = 0; r < NRpt; r++ )
         for ( k = 0; k < N; k++ )
             if ( IsNode[k].isOutlet )
-                fprintf(f, "outlet,%d,%s,%.17g,%.17g\n", r, Node[k].ID,
+                fprintf(f, "outlet,%d,%s,%.17g,%.17g\n", r, Node[IsNode[k].swmm].ID,
                     OOutflow[r][k], OHead[r][k]);
     fprintf(f, "kind,id,maxflow,maxtime,segments,dt\n");
     for ( i = 0; i < L; i++ )
-        fprintf(f, "max,%s,%.17g,%.17g,%d,%.17g\n", Link[i].ID, MaxQ[i], MaxT[i],
+        fprintf(f, "max,%s,%.17g,%.17g,%d,%.17g\n", Link[IsPipe[i].swmm].ID, MaxQ[i], MaxT[i],
             SegN[i], SegDt[i]);
-    fprintf(f, "kind,in,out,storage\nmassbal,%.17g,%.17g,%.17g\n", MbIn, MbOut, PipeStorage);
+    fprintf(f, "kind,report,id,chead\n");
+    for ( r = 0; r < NRpt; r++ )
+        for ( k = 0; k < N; k++ )
+            if ( IsNode[k].kind == IS_NODE_CHAMBER )
+                fprintf(f, "chamber,%d,%s,%.17g\n", r, Node[IsNode[k].swmm].ID, OHead[r][k]);
+    fprintf(f, "kind,report,id,wlevel,whead,wvolume,wpercent,woverflow\n");
+    for ( r = 0; r < NRpt; r++ )
+        for ( i = 0; i < IsNWell; i++ )
+            fprintf(f, "wetwell,%d,%s,%.17g,%.17g,%.17g,%.17g,%.17g\n", r,
+                Node[IsNode[IsWell[i].node].swmm].ID, MAX(0.0, RWLevel[r][i]),
+                OHead[r][IsWell[i].node], MAX(0.0, RWVol[r][i]), MAX(0.0, RWPct[r][i]),
+                MAX(0.0, RWOver[r][i]));
+    fprintf(f, "kind,report,id,fflow,fvel,floss\n");
+    for ( r = 0; r < NRpt; r++ )
+        for ( i = 0; i < IsNF; i++ )
+            fprintf(f, "fm,%d,%s,%.17g,%.17g,%.17g\n", r, Link[IsPipe[IsNP + i].swmm].ID,
+                RFFlow[r][i], RFVel[r][i], RFLoss[r][i]);
+    fprintf(f, "kind,report,id,pflow,phead,ppower,pusage,pspeed\n");
+    for ( r = 0; r < NRpt; r++ )
+        for ( i = 0; i < IsNPump; i++ )
+            fprintf(f, "pump,%d,%s,%.17g,%.17g,%.17g,%.17g,%.17g\n", r, Link[IsPump[i].swmm].ID,
+                RPFlow[r][i], RPHead[r][i],
+                MAX(0.0, RPFlow[r][i]*RPHead[r][i]*(62.4/550.0)),
+                RPUsage[r][i], RPUsage[r][i] > 0.0 ? RPSpeed[r][i] : 0.0);
+    fprintf(f, "kind,in,out,storage,initwell,finalwell,wellflood\n"
+               "massbal,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n", MbIn, MbOut,
+               IsLinkReport ? PipeStorage : 0.5 * PipeStorage,
+               MbInitStorage, MbFinalStorage, MbWellOverflow);
     fclose(f);
 }
 
@@ -1111,13 +1803,21 @@ static void writeCsv(void)
 
 void isewer_epsClose(void)
 {
-    int p, L = Nobjects[LINK];
+    int p, L = IsNP;
     if ( PatV ) for ( p = 0; p < IsNpats; p++ ) FREE(PatV[p]);
     FREE(PatV); FREE(PatN);
-    free2(DF, L);  DF = NULL;
+    free2(DF, IsNT);  DF = NULL;
     if ( Raw ) for ( p = 0; p < L; p++ ) FREE(Raw[p]);
     FREE(Raw); FREE(NRaw); FREE(MaxQ); FREE(MaxT); FREE(SegN); FREE(SegDt);
     FREE(CurQin); FREE(CurQout); FREE(CurVol);
+    FREE(Zero); FREE(LinkOrder); FREE(WriteLink); FREE(FmDone);
+    FREE(XStatus); FREE(XUsage); FREE(XSpeed); FREE(XFlow); FREE(XHead); FREE(XOn);
+    FREE(XH0); FREE(XA); FREE(XB); FREE(XPB);
+    free2(RWLevel, NRpt); free2(RWVol, NRpt); free2(RWPct, NRpt); free2(RWOver, NRpt);
+    free2(RPFlow, NRpt); free2(RPHead, NRpt); free2(RPUsage, NRpt); free2(RPSpeed, NRpt);
+    free2(RFFlow, NRpt); free2(RFVel, NRpt); free2(RFLoss, NRpt);
+    RWLevel = RWVol = RWPct = RWOver = RPFlow = RPHead = RPUsage = RPSpeed = RFFlow =
+    RFVel = RFLoss = NULL;
     free2(OFlow, NRpt); free2(OVel, NRpt); free2(ODepth, NRpt); free2(OdD, NRpt);
     free2(OqQ, NRpt); free2(OFroude, NRpt); free2(OBack, NRpt); free2(OAdjD, NRpt);
     free2(OAdjV, NRpt); free2(OFtype, NRpt); free2(OPartial, NRpt); free2(OUp, NRpt);

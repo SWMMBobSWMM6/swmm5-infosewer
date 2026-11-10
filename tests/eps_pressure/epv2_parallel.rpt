@@ -1,0 +1,13 @@
+Engine report trimmed to its mass balance block for the test suite.
+
+[Mass Balance Calculation]
+
+Total external inflow: 				   2310735.609 (cubic feet)
+Total storm inflow (part of external inflow): 	         0.000 (cubic feet)
+Total extern outflow: 				   1406813.943 (cubic feet)
+Total flooding out of open conduits: 		         0.000 (cubic feet)
+Initial Wet Well Storage: 			     10492.361 (cubic feet)
+Final Wet Well Storage: 			     11078.048 (cubic feet)
+Wet Well Flooding Volume: 			         0.000 (cubic feet)
+Final Gravity Main Storage: 			    421258.282 (cubic feet)
+Mass Balance Check: 				        20.768 (%) 
